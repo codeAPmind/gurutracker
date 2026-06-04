@@ -1,0 +1,65 @@
+gurus:
+  # === 长期跟踪 ===
+  - name: "巴菲特"
+    name_en: "Warren Buffett"
+    tier: "长期"
+    sources:
+      - type: "sec_13f"
+        cik: "0001067983"          # Berkshire Hathaway CIK
+      - type: "sec_form4"
+        cik: "0001067983"
+      - type: "fmp_13f"            # FMP数据源备选
+        symbol: "BRK-A"
+    thresholds:
+      heavy_position_pct: 5.0
+      significant_change_pct: 20.0
+
+  - name: "段永平"
+    name_en: "Duan Yongping"
+    tier: "长期"
+    sources:
+      - type: "social_media"
+        platform: "xueqiu"
+        user_id: "105534609"       # 雪球用户ID（大道无形我有型）
+      - type: "social_media"
+        platform: "x"
+        username: "YPDuan"
+    thresholds:
+      heavy_position_pct: 3.0
+
+  # === 中期跟踪 ===
+  - name: "ARK Invest"
+    name_en: "Cathie Wood"
+    tier: "中期"
+    sources:
+      - type: "ark_trades"
+        fund_codes: ["ARKK", "ARKW", "ARKG", "ARKF", "ARKX"]
+    thresholds:
+      significant_shares: 50000
+
+  - name: "黄仁勋"
+    name_en: "Jensen Huang"
+    tier: "中期"
+    sources:
+      - type: "sec_form4"
+        cik: "0001045810"          # NVIDIA CIK
+
+  # === 短期跟踪 ===
+  - name: "佩洛西"
+    name_en: "Nancy Pelosi"
+    tier: "短期"
+    sources:
+      - type: "congress"
+        member_id: "P000197"       # 国会成员ID
+    thresholds:
+      significant_amount_usd: 100000
+
+  - name: "马斯克"
+    name_en: "Elon Musk"
+    tier: "短期"
+    sources:
+      - type: "social_media"
+        platform: "x"
+        username: "elonmusk"
+      - type: "sec_form4"
+        cik: "0001318605"          # Tesla CIK
