@@ -317,9 +317,10 @@ class FMPCollector(BaseCollector):
     def __init__(self, symbol: str, guru_name: str):
         self.symbol = symbol
         self.guru_name = guru_name
-        from config.settings import FMP_API_KEY, FMP_BASE_URL
+        from config.settings import FMP_API_KEY, FMP_BASE_URL, FMP_STABLE_URL
         self.api_key = FMP_API_KEY
         self.base_url = FMP_BASE_URL
+        self.stable_url = FMP_STABLE_URL
 
     def get_source_name(self) -> str:
         return f"fmp:{self.guru_name}"
@@ -329,73 +330,14 @@ class FMPCollector(BaseCollector):
             logger.warning(f"[FMP] 未配置 FMP_API_KEY，跳过 {self.guru_name}")
             return []
 
-        events = []
-        events.extend(self._fetch_institutional_holdings())
-        events.extend(self._fetch_insider_trades())
-        return events
-
-    def _fetch_institutional_holdings(self) -> list[RawEvent]:
-        """获取机构持仓变动（13F类数据）"""
-        try:
-            url = f"{self.base_url}/institutional-holder/{self.symbol}"
-            resp = requests.get(url, params={"apikey": self.api_key}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-
-            checkpoint_key = f"fmp_holdings:{self.symbol}"
-            last_date = get_checkpoint(checkpoint_key)
-
-            events = []
-            for holder in data[:10]:  # 取前10大机构
-                date_str = holder.get("dateReported", "")
-                if date_str <= (last_date or ""):
-                    continue
-
-                holder_name = holder.get("holder", "")
-                shares = holder.get("shares", 0)
-                change = holder.get("change", 0)
-                change_pct = holder.get("changeInSharesNumberPercentage", 0)
-
-                if abs(change_pct or 0) < 5:  # 变动小于5%不记录
-                    continue
-
-                action = "增持" if (change or 0) > 0 else "减持"
-                content = (
-                    f"机构 {holder_name} {action} {self.symbol}\n"
-                    f"日期: {date_str}\n"
-                    f"持股数: {shares:,}\n"
-                    f"变动股数: {change:+,}\n"
-                    f"变动比例: {change_pct:+.1f}%"
-                )
-
-                events.append(RawEvent(
-                    guru_name=self.guru_name,
-                    event_type="filing",
-                    source="fmp_13f",
-                    raw_content=content,
-                    timestamp=datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.now(),
-                    metadata={
-                        "action": action,
-                        "ticker": self.symbol,
-                        "holder": holder_name,
-                        "shares": shares,
-                        "change": change,
-                        "change_pct": change_pct,
-                    },
-                ))
-
-            if events:
-                set_checkpoint(checkpoint_key, data[0].get("dateReported", ""))
-
-            return events
-        except Exception as e:
-            logger.error(f"[FMP] 机构持仓获取失败 {self.symbol}: {e}")
-            return []
+        # 注意：机构持仓端点（institutional-holder / institutional-ownership）
+        # 在 Starter 套餐下已被限制，且与 sec_13f 采集器功能重复，故不再调用。
+        return self._fetch_insider_trades()
 
     def _fetch_insider_trades(self) -> list[RawEvent]:
         """获取内部人交易"""
         try:
-            url = f"{self.base_url}/insider-trading"
+            url = f"{self.stable_url}/insider-trading/search"
             params = {"symbol": self.symbol, "limit": 20, "apikey": self.api_key}
             resp = requests.get(url, params=params, timeout=15)
             resp.raise_for_status()

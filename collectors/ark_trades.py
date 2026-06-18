@@ -65,6 +65,7 @@ class ARKTradesCollector(BaseCollector):
             direction = trade.get("direction", "")
             shares = abs(trade.get("shares", 0))
             etf = trade.get("fund", fund)
+            etf_pct = trade.get("etf_percent", 0) or 0
 
             if direction.upper() == "BUY":
                 action = "买入"
@@ -73,11 +74,12 @@ class ARKTradesCollector(BaseCollector):
             else:
                 continue
 
+            pct_line = f"\n占基金仓位: {etf_pct:.2f}%" if etf_pct else ""
             content = (
                 f"ARK Invest ({etf}) {action} {company} ({ticker})\n"
                 f"交易日期: {date_str}\n"
                 f"交易方向: {action}\n"
-                f"股数变动: {shares:,} 股\n"
+                f"股数变动: {shares:,} 股{pct_line}\n"
                 f"所属基金: {etf}"
             )
 
@@ -131,6 +133,7 @@ class ARKTradesCollector(BaseCollector):
                     "company": t.get("company", ""),
                     "direction": t.get("direction", ""),
                     "shares": t.get("shares", 0),
+                    "etf_percent": t.get("etf_percent", 0),
                     "fund": fund,
                 }
                 for t in trades

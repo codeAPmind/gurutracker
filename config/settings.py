@@ -11,6 +11,7 @@ DEEPSEEK_MODEL = "deepseek-chat"
 # FMP (Financial Modeling Prep) API — 可用于获取股票基本面、SEC数据等
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+FMP_STABLE_URL = "https://financialmodelingprep.com/stable"
 
 # 飞书
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
