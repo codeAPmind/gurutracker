@@ -14,6 +14,36 @@ gurus:
       heavy_position_pct: 5.0
       significant_change_pct: 20.0
 
+  - name: "桥水基金"
+    name_en: "Bridgewater Associates"
+    tier: "长期"
+    sources:
+      - type: "sec_13f"
+        cik: "0001350694"          # Bridgewater Associates CIK
+    thresholds:
+      heavy_position_pct: 5.0
+      significant_change_pct: 20.0
+
+  - name: "Michael Burry"
+    name_en: "Michael Burry"
+    tier: "长期"
+    sources:
+      - type: "sec_13f"
+        cik: "0001649339"          # Scion Asset Management CIK
+    thresholds:
+      heavy_position_pct: 5.0
+      significant_change_pct: 20.0
+
+  - name: "Bill Ackman"
+    name_en: "Bill Ackman"
+    tier: "长期"
+    sources:
+      - type: "sec_13f"
+        cik: "0001336528"          # Pershing Square CIK
+    thresholds:
+      heavy_position_pct: 5.0
+      significant_change_pct: 20.0
+
   - name: "段永平"
     name_en: "Duan Yongping"
     tier: "长期"
