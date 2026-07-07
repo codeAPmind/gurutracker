@@ -272,23 +272,32 @@ class XTwitterCollector(BaseCollector):
                 if not feed.entries:
                     continue
 
+                # 马斯克转发中值得保留的关键词（他本人公司相关）
+                RETWEET_KEEP_KEYWORDS = [
+                    "tesla", "tsla", "spacex", "space x", "特斯拉", "fsd",
+                    "cybertruck", "model y", "model 3", "starship", "starlink",
+                ]
+
                 tweets = []
                 for entry in feed.entries[:20]:
                     link = entry.get("link", "")
-
-                    # 过滤转发：Nitter RSS 的转发条目 URL 属于原作者而非被追踪用户
-                    # 例如追踪 elonmusk，转发条目 link 为 nitter.net/OtherUser/status/...
-                    if self.username.lower() not in link.lower():
-                        continue
-
-                    # 过滤文本中以 "RT @" 开头的转发
                     raw_title = entry.get("title", "")
-                    if raw_title.strip().startswith("RT @"):
-                        continue
+                    is_retweet = (
+                        self.username.lower() not in link.lower()
+                        or raw_title.strip().startswith("RT @")
+                    )
+
+                    if is_retweet:
+                        # 转发只保留涉及本人核心资产的内容
+                        combined = (raw_title + entry.get("summary", "")).lower()
+                        if not any(kw in combined for kw in RETWEET_KEEP_KEYWORDS):
+                            continue
 
                     tweet_id = entry.get("id", link).split("/")[-1]
                     text = entry.get("summary", raw_title)
                     text = BeautifulSoup(text, "html.parser").get_text(separator=" ").strip()
+                    if is_retweet:
+                        text = f"[转发] {text}"
 
                     pub_date = entry.get("published_parsed")
                     if pub_date:
