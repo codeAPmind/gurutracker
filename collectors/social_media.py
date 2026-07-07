@@ -274,8 +274,20 @@ class XTwitterCollector(BaseCollector):
 
                 tweets = []
                 for entry in feed.entries[:20]:
-                    tweet_id = entry.get("id", entry.get("link", "")).split("/")[-1]
-                    text = entry.get("summary", entry.get("title", ""))
+                    link = entry.get("link", "")
+
+                    # 过滤转发：Nitter RSS 的转发条目 URL 属于原作者而非被追踪用户
+                    # 例如追踪 elonmusk，转发条目 link 为 nitter.net/OtherUser/status/...
+                    if self.username.lower() not in link.lower():
+                        continue
+
+                    # 过滤文本中以 "RT @" 开头的转发
+                    raw_title = entry.get("title", "")
+                    if raw_title.strip().startswith("RT @"):
+                        continue
+
+                    tweet_id = entry.get("id", link).split("/")[-1]
+                    text = entry.get("summary", raw_title)
                     text = BeautifulSoup(text, "html.parser").get_text(separator=" ").strip()
 
                     pub_date = entry.get("published_parsed")
@@ -292,7 +304,7 @@ class XTwitterCollector(BaseCollector):
                         "id": tweet_id,
                         "text": text,
                         "timestamp": ts,
-                        "url": entry.get("link", ""),
+                        "url": link,
                     })
 
                 return tweets
