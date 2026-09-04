@@ -41,3 +41,10 @@ QUIVER_API_KEY = os.getenv("QUIVER_API_KEY", "")
 
 # 雪球 Cookie
 XUEQIU_COOKIE = os.getenv("XUEQIU_COOKIE", "")
+
+# Futu 模拟盘执行（executor/ 模块）
+GURU_TRADE_ENV = os.getenv("GURU_TRADE_ENV", "SIMULATE")  # SIMULATE / REAL
+GURU_BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "500"))
+GURU_MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
+GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.08"))
+GURU_STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.05"))

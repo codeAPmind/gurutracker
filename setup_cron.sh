@@ -28,11 +28,26 @@ exec python3 "$SCRIPT_DIR/scheduler.py" "$@"
 WRAPPER_EOF
 chmod +x "$WRAPPER"
 
+CONSUMER_WRAPPER="$SCRIPT_DIR/run_consumer.sh"
+cat > "$CONSUMER_WRAPPER" << 'CONSUMER_EOF'
+#!/bin/bash
+# 加载环境变量并运行 signal_consumer（09:35 ET）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+cd "$SCRIPT_DIR"
+exec python3 -m executor.signal_consumer "$@"
+CONSUMER_EOF
+chmod +x "$CONSUMER_WRAPPER"
+
 echo "📦 安装 Python 依赖..."
 pip3 install -r "$SCRIPT_DIR/requirements.txt" -q
 
 echo "🗄️  初始化数据库..."
-cd "$SCRIPT_DIR" && python3 -c "from storage.db import init_db; init_db()"
+cd "$SCRIPT_DIR" && python3 -c "from storage.db import init_db; init_db(); from executor.position_manager import init_db as pm_init; pm_init()"
 
 echo ""
 echo "📋 将以下内容添加到 crontab (运行 crontab -e):"
@@ -55,6 +70,9 @@ echo "0 8 * * 1 $WRAPPER --job sec_13f >> $LOG 2>&1"
 echo ""
 echo "# 每日汇总推送: 每天 21:00"
 echo "0 21 * * * $WRAPPER --job daily_digest >> $LOG 2>&1"
+echo ""
+echo "# 信号消费 & 止盈止损检查: 工作日 09:35 ET (北京时间 21:35/22:35)"
+echo "35 21 * * 1-5 $CONSUMER_WRAPPER >> $LOG 2>&1"
 echo ""
 echo ""
 echo "💡 也可以直接复制到剪贴板并运行 'crontab -e' 粘贴:"
@@ -80,6 +98,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
 */30 * * * * $WRAPPER --job social_media >> $LOG 2>&1
 0 8 * * 1 $WRAPPER --job sec_13f >> $LOG 2>&1
 0 21 * * * $WRAPPER --job daily_digest >> $LOG 2>&1
+35 21 * * 1-5 $CONSUMER_WRAPPER >> $LOG 2>&1
 EOF
         crontab /tmp/current_crontab
         echo "✅ cron 任务安装成功！"
