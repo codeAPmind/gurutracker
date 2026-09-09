@@ -183,7 +183,7 @@ def run() -> None:
             ticker = sig["ticker"]
             if not ticker or ticker in ("", "N/A"):
                 continue
-            if already_holding(ticker):
+            if already_holding(ticker, trader=trader):
                 logger.info("[consumer] skip %s (already holding)", ticker)
                 continue
 

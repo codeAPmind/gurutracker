@@ -108,13 +108,29 @@ def get_open_positions() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def already_holding(ticker: str) -> bool:
+def already_holding(ticker: str, trader=None) -> bool:
+    """本地记录表 + broker 真实持仓 双重检查，避免在已有仓位(含非本系统开的)上重复买入"""
     with _conn() as con:
         row = con.execute(
             "SELECT id FROM guru_positions WHERE ticker=? AND status IN ('open', 'closing') LIMIT 1",
             (ticker,),
         ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+
+    if trader is not None:
+        try:
+            broker_qty = trader.get_position(f"US.{ticker}")
+            if broker_qty > 0:
+                logger.warning(
+                    "[pos] %s broker实际持仓%d股（非本系统跟踪），视为已持仓跳过",
+                    ticker, broker_qty,
+                )
+                return True
+        except Exception as e:
+            logger.error("[pos] 查询broker持仓失败 %s: %s，保守视为已持仓", ticker, e)
+            return True
+    return False
 
 
 def _trading_days_held(entry_date: str) -> int:
