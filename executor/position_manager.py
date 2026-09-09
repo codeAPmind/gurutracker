@@ -27,6 +27,7 @@ TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.08"))
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.05"))
 MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
+MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "5"))  # 总资金5000/单笔1000 → 最多5只并持
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS guru_positions (

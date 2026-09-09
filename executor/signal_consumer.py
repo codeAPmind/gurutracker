@@ -6,17 +6,20 @@ Guru Tracker 信号消费 & 自动下单
 
 买入条件（三选二组合，2026-06~09 历史信号 sweep 得出，见下方 SWEEP 说明）：
 1. score >= MIN_SCORE（触发阈值）
-2. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认20%）
+2. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认30%）
 3. 该笔信号仓位占比（ARK etf_percent）> GURU_MIN_POSITION_PCT（默认0.10%）
 
-SWEEP 依据（回调>=20% + 仓位>0.10%，持仓10日，n=46）：
-  胜率 63%，均值收益 +6.8%，Sharpe 2.3，PF 2.14
+SWEEP 依据（回调>=30% + 仓位>0.10%，持仓10日，n=30）：
+  胜率 67%，均值收益 +9.2%，Sharpe 2.78，PF 2.25
 放弃"连续买入"这条（单独统计样本量过小，且与仓位/回调条件高度重叠）。
+本金规模较小时优先胜率，故选30%回调门槛而非20%（触发更少但更准）。
+
+仓位管理：本金5000美元，单笔额度1000美元，最多同时持仓 GURU_MAX_POSITIONS（默认5）只。
 
 逻辑：
 1. 读取近2日 score >= MIN_SCORE 的 buy 信号
 2. 过滤：回调幅度 + 仓位占比双重门槛
-3. 跳过已持仓的 ticker
+3. 跳过已持仓的 ticker，检查当前持仓数是否已达上限
 4. 按 GURU_BUDGET_USD（默认1000）限价买入
 5. 检查所有 open 持仓：止盈/止损/到期（10日）三种平仓触发
 """
@@ -33,7 +36,7 @@ import requests
 
 from config.settings import DB_PATH, FMP_API_KEY, FMP_STABLE_URL
 from executor.position_manager import (
-    BUDGET_USD, already_holding, check_exit_signal, close_position,
+    BUDGET_USD, MAX_POSITIONS, already_holding, check_exit_signal, close_position,
     get_open_positions, init_db, mark_closing, open_position,
 )
 from executor.futu_trader import GuruFutuTrader
@@ -163,7 +166,20 @@ def run() -> None:
 
     try:
         # ── 新信号买入 ────────────────────────────────────────────────
+        open_count = len(get_open_positions())
+        slots_left = max(0, MAX_POSITIONS - open_count)
+        if slots_left == 0:
+            logger.info("[consumer] 已达最大持仓数 MAX_POSITIONS=%d（当前%d），本轮不新开仓",
+                        MAX_POSITIONS, open_count)
+        else:
+            logger.info("[consumer] 当前持仓%d/%d，本轮最多可开%d个新仓",
+                        open_count, MAX_POSITIONS, slots_left)
+
         for sig in signals:
+            if slots_left <= 0:
+                logger.info("[consumer] 持仓已满，跳过剩余信号")
+                break
+
             ticker = sig["ticker"]
             if not ticker or ticker in ("", "N/A"):
                 continue
@@ -191,6 +207,7 @@ def run() -> None:
             )
             if order_id:
                 _on_fill.__closure__[3].cell_contents[0] = order_id  # patch _oid_holder
+                slots_left -= 1
 
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         positions = get_open_positions()
