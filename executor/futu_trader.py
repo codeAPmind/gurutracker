@@ -237,6 +237,7 @@ class GuruFutuTrader:
         env_str = os.getenv("GURU_TRADE_ENV", "SIMULATE")
         self.trd_env = TrdEnv.REAL if env_str.upper() == "REAL" else TrdEnv.SIMULATE
 
+        logger.info("[futu][API] OpenSecTradeContext(host=%s, port=%d, market=US)", host, port)
         self.ctx = OpenSecTradeContext(
             filter_trdmarket=TrdMarket.US,
             host=host,
@@ -244,7 +245,9 @@ class GuruFutuTrader:
             is_encrypt=False,
         )
         if pwd_md5:
-            self.ctx.unlock_trade(pwd_md5, is_unlock=True)
+            logger.info("[futu][API] unlock_trade()")
+            unlock_ret = self.ctx.unlock_trade(pwd_md5, is_unlock=True)
+            logger.info("[futu][API] unlock_trade result=%s", unlock_ret)
 
         self._resolve_acc_id()
         self._connected = True
@@ -252,17 +255,22 @@ class GuruFutuTrader:
 
     def close(self) -> None:
         if self.ctx:
+            logger.info("[futu][API] ctx.close()")
             self.ctx.close()
             self._connected = False
+        logger.info("[futu] disconnected")
 
     def _resolve_acc_id(self) -> None:
         from futu import RET_OK, TrdEnv, TrdMarket
 
         env_acc = os.getenv("FUTU_ACCOUNT_US", "").strip()
 
+        logger.info("[futu][API] get_acc_list()")
         ret, df = self.ctx.get_acc_list()
         if ret != RET_OK:
+            logger.error("[futu][API] get_acc_list failed: %s", df)
             raise RuntimeError(f"[futu] get_acc_list failed: {df}")
+        logger.info("[futu][API] get_acc_list → %d accounts", len(df))
 
         def _total_assets(acc_row) -> float:
             try:
@@ -300,26 +308,37 @@ class GuruFutuTrader:
     def get_position(self, code: str) -> int:
         """返回 US.CODE 当前持仓股数（can_sell_qty）"""
         from futu import RET_OK
+        logger.debug("[futu][API] position_list_query(code=%s)", code)
         ret, df = self.ctx.position_list_query(
             code=code, trd_env=self.trd_env, acc_id=self.acc_id
         )
         if ret != RET_OK or df.empty:
+            logger.debug("[futu][API] position_list_query(%s) → 无持仓 (ret=%s)", code, ret)
             return 0
         row = df[df["code"] == code]
         if row.empty:
             return 0
-        return int(row.iloc[0].get("can_sell_qty", 0) or 0)
+        qty = int(row.iloc[0].get("can_sell_qty", 0) or 0)
+        logger.debug("[futu][API] position_list_query(%s) → can_sell_qty=%d", code, qty)
+        return qty
 
     def wait_for_sellable(self, code: str, min_qty: int = 1,
                           poll_interval: float = 0.3, timeout: float = 2.5) -> int:
         """撤单后轮询直到 can_sell_qty >= min_qty 或超时（2026-09-02 fix）"""
+        logger.info("[futu] wait_for_sellable(%s, min_qty=%d, timeout=%.1fs) 开始轮询", code, min_qty, timeout)
         deadline = time.monotonic() + timeout
+        polls = 0
         while time.monotonic() < deadline:
             qty = self.get_position(code)
+            polls += 1
             if qty >= min_qty:
+                logger.info("[futu] wait_for_sellable(%s) 达标 qty=%d (轮询%d次)", code, qty, polls)
                 return qty
             time.sleep(poll_interval)
-        return self.get_position(code)
+        final_qty = self.get_position(code)
+        logger.warning("[futu] wait_for_sellable(%s) 超时未达标 qty=%d/%d (轮询%d次)",
+                       code, final_qty, min_qty, polls)
+        return final_qty
 
     def _adjust_sell_qty(self, code: str, qty: int, purpose: str) -> int:
         """总是向券商查询真实 can_sell_qty，不依赖本地记录"""
@@ -341,6 +360,8 @@ class GuruFutuTrader:
         limit_price = round_to_us_tick(ref_price * (1 + _ENTRY_SLIPPAGE))
         qty = max(1, int(budget_usd / limit_price))
 
+        logger.info("[futu][API] place_order(BUY code=%s qty=%d price=%.4f ref_price=%.4f budget=%.0f env=%s)",
+                    code, qty, limit_price, ref_price, budget_usd, self.trd_env)
         ret, df = self.ctx.place_order(
             price=limit_price,
             qty=qty,
@@ -351,13 +372,13 @@ class GuruFutuTrader:
             acc_id=self.acc_id,
         )
         if ret != RET_OK or df.empty:
-            logger.error("[futu] place_entry_order failed ticker=%s: %s", ticker, df)
+            logger.error("[futu][API] place_order(BUY) failed ticker=%s: %s", ticker, df)
             return None
 
         order_id = str(df.iloc[0]["order_id"])
         if on_fill:
             _register_fill_callback(order_id, on_fill)
-        logger.info("[futu] BUY order=%s %s qty=%d price=%.4f", order_id, ticker, qty, limit_price)
+        logger.info("[futu] BUY 下单成功 order=%s %s qty=%d price=%.4f", order_id, ticker, qty, limit_price)
         return order_id
 
     def place_sell_order(self, ticker: str, qty: int, ref_price: float,
@@ -369,10 +390,13 @@ class GuruFutuTrader:
         code = f"US.{ticker}"
         qty = self._adjust_sell_qty(code, qty, purpose)
         if qty <= 0:
+            logger.warning("[futu] SELL 中止 %s (%s): 可卖数量为0", ticker, purpose)
             return None
 
         limit_price = round_to_us_tick(ref_price * (1 + _SELL_SLIPPAGE))
 
+        logger.info("[futu][API] place_order(SELL code=%s qty=%d price=%.4f ref_price=%.4f purpose=%s env=%s)",
+                    code, qty, limit_price, ref_price, purpose, self.trd_env)
         ret, df = self.ctx.place_order(
             price=limit_price,
             qty=qty,
@@ -383,14 +407,15 @@ class GuruFutuTrader:
             acc_id=self.acc_id,
         )
         if ret != RET_OK or df.empty:
-            logger.error("[futu] place_sell_order failed %s %s: %s", purpose, ticker, df)
+            logger.error("[futu][API] place_order(SELL) failed %s %s: %s", purpose, ticker, df)
             return None
 
         order_id = str(df.iloc[0]["order_id"])
         if on_fill:
             _register_fill_callback(order_id, on_fill)
         stop_order_monitor.register(order_id, code, qty, ref_price, self)
-        logger.info("[futu] SELL order=%s %s qty=%d price=%.4f (%s)", order_id, ticker, qty, limit_price, purpose)
+        logger.info("[futu] SELL 下单成功 order=%s %s qty=%d price=%.4f (%s)",
+                    order_id, ticker, qty, limit_price, purpose)
         return order_id
 
     def place_market_sell(self, ticker: str, qty: int, purpose: str = "market_sell") -> Optional[str]:
@@ -400,8 +425,11 @@ class GuruFutuTrader:
         code = f"US.{ticker}"
         qty = self._adjust_sell_qty(code, qty, purpose)
         if qty <= 0:
+            logger.warning("[futu] MARKET_SELL 中止 %s (%s): 可卖数量为0", ticker, purpose)
             return None
 
+        logger.info("[futu][API] place_order(MARKET_SELL code=%s qty=%d purpose=%s env=%s)",
+                    code, qty, purpose, self.trd_env)
         ret, df = self.ctx.place_order(
             price=0,
             qty=qty,
@@ -412,17 +440,18 @@ class GuruFutuTrader:
             acc_id=self.acc_id,
         )
         if ret != RET_OK or df.empty:
-            logger.error("[futu] place_market_sell failed %s %s: %s", purpose, ticker, df)
+            logger.error("[futu][API] place_order(MARKET_SELL) failed %s %s: %s", purpose, ticker, df)
             return None
 
         order_id = str(df.iloc[0]["order_id"])
-        logger.info("[futu] MARKET_SELL order=%s %s qty=%d (%s)", order_id, ticker, qty, purpose)
+        logger.info("[futu] MARKET_SELL 下单成功 order=%s %s qty=%d (%s)", order_id, ticker, qty, purpose)
         return order_id
 
     def cancel_order(self, order_id: str) -> bool:
         """撤单（2026-08-21 fix: 必须用 ModifyOrderOp.CANCEL 枚举）"""
         from futu import RET_OK, ModifyOrderOp
 
+        logger.info("[futu][API] modify_order(CANCEL order_id=%s)", order_id)
         ret, df = self.ctx.modify_order(
             modify_order_op=ModifyOrderOp.CANCEL,
             order_id=order_id,
@@ -432,8 +461,10 @@ class GuruFutuTrader:
             acc_id=self.acc_id,
         )
         ok = ret == RET_OK
-        if not ok:
-            logger.error("[futu] cancel_order failed order=%s: %s", order_id, df)
+        if ok:
+            logger.info("[futu] 撤单成功 order=%s", order_id)
+        else:
+            logger.error("[futu][API] modify_order(CANCEL) failed order=%s: %s", order_id, df)
         stop_order_monitor.remove(order_id)
         return ok
 
@@ -443,12 +474,16 @@ class GuruFutuTrader:
             from futu import OpenQuoteContext, RET_OK
             host = os.getenv("FUTU_HOST", "127.0.0.1")
             port = int(os.getenv("FUTU_PORT", "11112"))
+            logger.debug("[futu][API] get_market_snapshot(US.%s)", ticker)
             qctx = OpenQuoteContext(host=host, port=port)
             ret, df = qctx.get_market_snapshot([f"US.{ticker}"])
             qctx.close()
             if ret != RET_OK or df.empty:
+                logger.warning("[futu][API] get_market_snapshot(US.%s) 无数据 ret=%s", ticker, ret)
                 return None
-            return float(df.iloc[0]["last_price"])
+            price = float(df.iloc[0]["last_price"])
+            logger.debug("[futu][API] get_market_snapshot(US.%s) → last_price=%.4f", ticker, price)
+            return price
         except Exception as e:
-            logger.error("[futu] get_price %s: %s", ticker, e)
+            logger.error("[futu][API] get_market_snapshot(US.%s) 异常: %s", ticker, e)
             return None

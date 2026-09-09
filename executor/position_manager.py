@@ -73,7 +73,10 @@ def open_position(ticker: str, signal_id: int, order_id: str,
                VALUES (?, ?, ?, ?, ?, ?, 'open')""",
             (ticker, signal_id, order_id, qty, entry_price, today),
         )
-        return cur.lastrowid
+        pos_id = cur.lastrowid
+    logger.info("[持仓DB] 新建持仓 pos_id=%d %s qty=%d 成本=$%.4f 建仓日=%s signal_id=%s order=%s",
+                pos_id, ticker, qty, entry_price, today, signal_id, order_id)
+    return pos_id
 
 
 def mark_closing(pos_id: int, exit_order_id: str) -> None:
@@ -82,6 +85,7 @@ def mark_closing(pos_id: int, exit_order_id: str) -> None:
             "UPDATE guru_positions SET status='closing', exit_order_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (exit_order_id, pos_id),
         )
+    logger.info("[持仓DB] pos_id=%d 状态→closing, exit_order=%s", pos_id, exit_order_id)
 
 
 def close_position(pos_id: int, exit_price: float) -> None:
@@ -97,7 +101,8 @@ def close_position(pos_id: int, exit_price: float) -> None:
                WHERE id=?""",
             (exit_price, today, pnl_pct, pos_id),
         )
-        logger.info("[pos] closed pos_id=%d exit=%.4f pnl=%.2f%%", pos_id, exit_price, pnl_pct or 0)
+        logger.info("[持仓DB] pos_id=%d 状态→closed 卖出价=$%.4f 盈亏=%+.2f%% 平仓日=%s",
+                    pos_id, exit_price, pnl_pct or 0, today)
 
 
 def get_open_positions() -> list[dict]:
