@@ -39,7 +39,8 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 fi
 cd "$SCRIPT_DIR"
-exec python3 -m executor.signal_consumer "$@"
+# futu SDK 装在 US_YiDong_AutoTrader 的 conda 环境里，直接复用（勿改回系统 python3）
+exec /Users/openclaw/miniconda3/envs/US_AutoTrader/bin/python -m executor.signal_consumer "$@"
 CONSUMER_EOF
 chmod +x "$CONSUMER_WRAPPER"
 
