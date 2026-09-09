@@ -2,16 +2,27 @@
 Guru Tracker 持仓管理（SQLite）+ 止盈/止损/到期检查
 
 策略参数（可通过 env 覆盖）：
-  GURU_TAKE_PROFIT_PCT  默认 0.15 (+15%)
+  GURU_TAKE_PROFIT_PCT  默认 0 = **禁用止盈**（>0 时才启用）
   GURU_STOP_LOSS_PCT    默认 -0.15 (-15%)
   GURU_MAX_HOLD_DAYS    默认 10（交易日），到期无论盈亏市价平仓
   GURU_BUDGET_USD       每笔买入金额，默认 1000
 
-止盈止损取值依据（2026-09-09 修正）：
+出场规则演进（2026-09-09）：
 原 +8%/-5% 是在"持满10日、无止盈止损"的回测目标上选出的，与实盘执行严重脱节——
-实测该配置下 96% 仓位提前离场（平均持有3.6日），胜率仅48%、中位数-1.43%、t=0.87。
-改用 +15%/-15% 后：17笔、胜率65%、均值+5.27%、t=1.58，且前3笔仅占总收益75%
-（对照"纯持10天"方案前3笔占100%，过度依赖离群值）。
+实测 96% 仓位提前离场（平均持有3.6日），胜率仅48%、中位数-1.43%、t=0.87。
+
+对三种方案做了完整对比（n=13~17，含滑点/5仓位约束）：
+  A 纯持10天       : 均值+8.45% t=1.49 最差-22.3%  期末$6,098
+  B +15%/-15%      : 均值+5.27% t=1.58 最差-17.9%  期末$5,895
+  C 持10天+(-15%)止损: 均值+7.78% t=1.53 最差-17.9%  期末$6,167  ← 采用
+
+选 C 的理由：
+1. C 严格优于 A——上行完全相同，下行从-22.3%收窄到-17.9%，无代价
+2. C vs B 统计上无法区分（bootstrap 10000次，C优于B仅65.5%，需>95%）
+   但 C 少一个拟合参数：B 的+15%止盈位无独立依据，是在同一份数据上挑出的；
+   C 的两条规则各有理由（止损=封尾部风险，10日=资金周转）
+3. 策略赚的是深度回调后的大幅反弹，止盈会截断收益来源
+   （B 把 +50/+34/+34 削成 +25/+21/+21）
 
 ⚠️ t值仍 < 2，策略尚未通过统计检验，当前仅可用于 SIMULATE 验证。
 """
@@ -28,7 +39,7 @@ from config.settings import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.15"))
+TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止盈
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
 MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
@@ -156,15 +167,17 @@ def _trading_days_held(entry_date: str) -> int:
 def check_exit_signal(pos: dict, current_price: float) -> Optional[str]:
     """返回 'take_profit' / 'stop_loss' / 'max_hold' / None
 
-    max_hold: 持仓达到 MAX_HOLD_DAYS 交易日，无论盈亏强制平仓
-    （sweep 依据：10日持有窗口的胜率/收益指标是在此周期下验证的，
-    超期持有会脱离已验证的参数区间）
+    当前策略（方案C）默认不设止盈：TAKE_PROFIT_PCT<=0 时禁用止盈，
+    让反弹跑满 MAX_HOLD_DAYS，仅用 STOP_LOSS_PCT 封住尾部风险。
+    理由：策略赚的就是深度回调后的大幅反弹，人为设止盈会截断收益来源，
+    且止盈位没有独立依据（纯拟合产物）。详见 STRATEGY.md §5.5。
     """
     entry = pos.get("entry_price")
     if not entry or entry <= 0:
         return None
     chg = (current_price - entry) / entry
-    if chg >= TAKE_PROFIT_PCT:
+
+    if TAKE_PROFIT_PCT > 0 and chg >= TAKE_PROFIT_PCT:
         return "take_profit"
     if chg <= STOP_LOSS_PCT:
         return "stop_loss"

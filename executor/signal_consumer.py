@@ -275,8 +275,9 @@ def run() -> None:
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         logger.info("-" * 70)
         positions = get_open_positions()
-        logger.info("[卖出阶段] 检查 %d 个持仓 (止盈+%.0f%% / 止损%.0f%% / 到期%d日)",
-                    len(positions), TAKE_PROFIT_PCT * 100, STOP_LOSS_PCT * 100, MAX_HOLD_DAYS)
+        tp_desc = f"止盈+{TAKE_PROFIT_PCT*100:.0f}%" if TAKE_PROFIT_PCT > 0 else "止盈已禁用"
+        logger.info("[卖出阶段] 检查 %d 个持仓 (%s / 止损%.0f%% / 到期%d日)",
+                    len(positions), tp_desc, STOP_LOSS_PCT * 100, MAX_HOLD_DAYS)
 
         for pos in positions:
             if pos["status"] == "closing":

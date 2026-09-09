@@ -53,5 +53,5 @@ GURU_MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
 GURU_DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))
 GURU_MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))
 GURU_MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
-GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.15"))
+GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止盈
 GURU_STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
