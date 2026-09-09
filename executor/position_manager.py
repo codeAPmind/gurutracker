@@ -1,14 +1,19 @@
 """
 Guru Tracker 持仓管理（SQLite）+ 止盈/止损/到期检查
 
-策略参数（可通过 env 覆盖，基于 2026-06~09 历史信号 sweep 出的参数）：
-  GURU_TAKE_PROFIT_PCT  默认 0.08 (+8%)
-  GURU_STOP_LOSS_PCT    默认 -0.05 (-5%)
+策略参数（可通过 env 覆盖）：
+  GURU_TAKE_PROFIT_PCT  默认 0.15 (+15%)
+  GURU_STOP_LOSS_PCT    默认 -0.15 (-15%)
   GURU_MAX_HOLD_DAYS    默认 10（交易日），到期无论盈亏市价平仓
   GURU_BUDGET_USD       每笔买入金额，默认 1000
 
-sweep 依据（回调>=20% + 仓位>0.10%，持仓10日，n=46）：
-  胜率 63%，均值 +6.8%，Sharpe 2.3，PF 2.14
+止盈止损取值依据（2026-09-09 修正）：
+原 +8%/-5% 是在"持满10日、无止盈止损"的回测目标上选出的，与实盘执行严重脱节——
+实测该配置下 96% 仓位提前离场（平均持有3.6日），胜率仅48%、中位数-1.43%、t=0.87。
+改用 +15%/-15% 后：17笔、胜率65%、均值+5.27%、t=1.58，且前3笔仅占总收益75%
+（对照"纯持10天"方案前3笔占100%，过度依赖离群值）。
+
+⚠️ t值仍 < 2，策略尚未通过统计检验，当前仅可用于 SIMULATE 验证。
 """
 from __future__ import annotations
 
@@ -23,8 +28,8 @@ from config.settings import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.08"))
-STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.05"))
+TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.15"))
+STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
 MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
 MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "5"))  # 总资金5000/单笔1000 → 最多5只并持
