@@ -34,14 +34,26 @@ from typing import Optional
 
 import requests
 
-from config.settings import DB_PATH, FMP_API_KEY, FMP_STABLE_URL
+from config.settings import DB_PATH, FMP_API_KEY, FMP_STABLE_URL, GURU_TRADE_ENV
 from executor.position_manager import (
     BUDGET_USD, MAX_POSITIONS, already_holding, check_exit_signal, close_position,
     get_open_positions, init_db, mark_closing, open_position,
 )
 from executor.futu_trader import GuruFutuTrader
+from notifier.feishu_bot import send_text_to_feishu
 
 logger = logging.getLogger(__name__)
+
+_ENV_TAG = "🧪模拟盘" if GURU_TRADE_ENV.upper() != "REAL" else "💰实盘"
+
+
+def _notify(text: str) -> None:
+    """所有 executor 下单/成交通知统一走这里，方便在飞书里区分来源"""
+    msg = f"【GuruTracker执行器·{_ENV_TAG}】\n{text}"
+    try:
+        send_text_to_feishu(msg)
+    except Exception as e:
+        logger.error("[consumer] 飞书通知发送失败: %s", e)
 
 MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
 DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "20"))       # 相对60日高点回调百分比（正数）
@@ -198,6 +210,14 @@ def run() -> None:
             def _on_fill(qty: int, avg_price: float, _ticker=ticker, _sig=sig, _oid_holder=[None]):
                 logger.info("[consumer] filled BUY %s qty=%d avg=%.4f", _ticker, qty, avg_price)
                 open_position(_ticker, _sig["id"], _oid_holder[0] or "", qty, avg_price)
+                _notify(
+                    f"✅ 买入成交\n"
+                    f"股票: {_ticker}\n"
+                    f"数量: {qty} 股\n"
+                    f"成交价: ${avg_price:.2f}\n"
+                    f"金额: ${qty * avg_price:,.0f}\n"
+                    f"信号分数: {_sig['score']:.0f}"
+                )
 
             order_id = trader.place_entry_order(
                 ticker=ticker,
@@ -208,6 +228,13 @@ def run() -> None:
             if order_id:
                 _on_fill.__closure__[3].cell_contents[0] = order_id  # patch _oid_holder
                 slots_left -= 1
+                _notify(
+                    f"📤 已下单 BUY\n"
+                    f"股票: {ticker}\n"
+                    f"参考价: ${price:.2f}\n"
+                    f"预算: ${BUDGET_USD:,.0f}\n"
+                    f"order_id: {order_id}"
+                )
 
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         positions = get_open_positions()
@@ -228,15 +255,38 @@ def run() -> None:
             logger.info("[consumer] EXIT signal %s for %s price=%.4f entry=%.4f reason=%s",
                         ticker, pos["id"], price, pos["entry_price"] or 0, reason)
 
+            reason_label = {"take_profit": "止盈", "stop_loss": "止损", "max_hold": "到期平仓"}.get(reason, reason)
+
+            def _on_exit_fill(qty: int, avg_price: float, _pos=pos, _ticker=ticker, _reason=reason_label):
+                close_position(_pos["id"], avg_price)
+                entry = _pos.get("entry_price") or 0
+                pnl_pct = (avg_price / entry - 1) * 100 if entry else 0
+                _notify(
+                    f"🔴 卖出成交（{_reason}）\n"
+                    f"股票: {_ticker}\n"
+                    f"数量: {qty} 股\n"
+                    f"成交价: ${avg_price:.2f}\n"
+                    f"买入价: ${entry:.2f}\n"
+                    f"盈亏: {pnl_pct:+.2f}%"
+                )
+
             exit_order_id = trader.place_sell_order(
                 ticker=ticker,
                 qty=pos["qty"],
                 ref_price=price,
                 purpose=reason,
-                on_fill=lambda qty, avg, _pos=pos: close_position(_pos["id"], avg),
+                on_fill=_on_exit_fill,
             )
             if exit_order_id:
                 mark_closing(pos["id"], exit_order_id)
+                _notify(
+                    f"📤 已下单 SELL（触发: {reason_label}）\n"
+                    f"股票: {ticker}\n"
+                    f"数量: {pos['qty']} 股\n"
+                    f"参考价: ${price:.2f}\n"
+                    f"买入价: ${pos['entry_price'] or 0:.2f}\n"
+                    f"order_id: {exit_order_id}"
+                )
 
     finally:
         trader.close()
