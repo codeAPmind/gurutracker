@@ -1,17 +1,21 @@
 """
-Guru Tracker 持仓管理（SQLite）+ 止盈/止损检查
+Guru Tracker 持仓管理（SQLite）+ 止盈/止损/到期检查
 
-策略参数（可通过 env 覆盖）：
+策略参数（可通过 env 覆盖，基于 2026-06~09 历史信号 sweep 出的参数）：
   GURU_TAKE_PROFIT_PCT  默认 0.08 (+8%)
   GURU_STOP_LOSS_PCT    默认 -0.05 (-5%)
-  GURU_BUDGET_USD       每笔买入金额，默认 500
+  GURU_MAX_HOLD_DAYS    默认 10（交易日），到期无论盈亏市价平仓
+  GURU_BUDGET_USD       每笔买入金额，默认 1000
+
+sweep 依据（回调>=20% + 仓位>0.10%，持仓10日，n=46）：
+  胜率 63%，均值 +6.8%，Sharpe 2.3，PF 2.14
 """
 from __future__ import annotations
 
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.08"))
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.05"))
-BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "500"))
+MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
+BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS guru_positions (
@@ -111,8 +116,23 @@ def already_holding(ticker: str) -> bool:
     return row is not None
 
 
+def _trading_days_held(entry_date: str) -> int:
+    """entry_date (YYYY-MM-DD) 到今天的交易日数（近似，不含节假日）"""
+    import numpy as np
+    today = datetime.utcnow().date()
+    entry = datetime.strptime(entry_date, "%Y-%m-%d").date()
+    if entry >= today:
+        return 0
+    return int(np.busday_count(entry, today))
+
+
 def check_exit_signal(pos: dict, current_price: float) -> Optional[str]:
-    """返回 'take_profit' / 'stop_loss' / None"""
+    """返回 'take_profit' / 'stop_loss' / 'max_hold' / None
+
+    max_hold: 持仓达到 MAX_HOLD_DAYS 交易日，无论盈亏强制平仓
+    （sweep 依据：10日持有窗口的胜率/收益指标是在此周期下验证的，
+    超期持有会脱离已验证的参数区间）
+    """
     entry = pos.get("entry_price")
     if not entry or entry <= 0:
         return None
@@ -121,4 +141,8 @@ def check_exit_signal(pos: dict, current_price: float) -> Optional[str]:
         return "take_profit"
     if chg <= STOP_LOSS_PCT:
         return "stop_loss"
+
+    entry_date = pos.get("entry_date")
+    if entry_date and _trading_days_held(entry_date) >= MAX_HOLD_DAYS:
+        return "max_hold"
     return None

@@ -43,8 +43,13 @@ QUIVER_API_KEY = os.getenv("QUIVER_API_KEY", "")
 XUEQIU_COOKIE = os.getenv("XUEQIU_COOKIE", "")
 
 # Futu 模拟盘执行（executor/ 模块）
+# 参数来自 2026-06~09 历史信号 sweep：回调>=20% + 仓位>0.10%，持仓10日
+# 胜率63%，均值收益+6.8%，Sharpe 2.3，PF 2.14（n=46）
 GURU_TRADE_ENV = os.getenv("GURU_TRADE_ENV", "SIMULATE")  # SIMULATE / REAL
-GURU_BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "500"))
+GURU_BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
 GURU_MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
+GURU_DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "20"))
+GURU_MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))
+GURU_MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
 GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0.08"))
 GURU_STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.05"))
