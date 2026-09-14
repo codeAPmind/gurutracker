@@ -4,27 +4,31 @@ Guru Tracker 持仓管理（SQLite）+ 止盈/止损/到期检查
 策略参数（可通过 env 覆盖）：
   GURU_TAKE_PROFIT_PCT  默认 0 = **禁用止盈**（>0 时才启用）
   GURU_STOP_LOSS_PCT    默认 -0.15 (-15%)
-  GURU_MAX_HOLD_DAYS    默认 10（交易日），到期无论盈亏市价平仓
+  GURU_MAX_HOLD_DAYS    默认 20（交易日），D1下仅作安全兜底
+  GURU_BOLL_PERIOD      默认 20，布林带中轨周期（主出场依据）
   GURU_BUDGET_USD       每笔买入金额，默认 1000
 
-出场规则演进（2026-09-09）：
-原 +8%/-5% 是在"持满10日、无止盈止损"的回测目标上选出的，与实盘执行严重脱节——
-实测 96% 仓位提前离场（平均持有3.6日），胜率仅48%、中位数-1.43%、t=0.87。
+出场规则演进（2026-09-09，两轮修正）：
+第1轮：原 +8%/-5% 是在"持满10日无止盈损"的回测目标上选的，与实盘严重脱节——
+       实测96%仓位提前离场(均持3.6日)，胜率48%、中位-1.43%、t=0.87。
+第2轮：固定持有天数本身没有市场含义。改用布林带中轨(均值回归目标)出场。
 
-对三种方案做了完整对比（n=13~17，含滑点/5仓位约束）：
-  A 纯持10天       : 均值+8.45% t=1.49 最差-22.3%  期末$6,098
-  B +15%/-15%      : 均值+5.27% t=1.58 最差-17.9%  期末$5,895
-  C 持10天+(-15%)止损: 均值+7.78% t=1.53 最差-17.9%  期末$6,167  ← 采用
+完整对比（n=13~19，含滑点/5仓位约束/already_holding）：
+  A  纯持10天          : 均值+8.45% t=1.49 胜率69% 最差-22.3% 期末$6,098
+  B  +15%/-15%         : 均值+5.27% t=1.58 胜率65% 最差-17.9% 期末$5,895
+  C  持10日+(-15%)止损  : 均值+8.72% t=1.63 胜率71% 最差-17.9% 期末$6,221
+  D1 回中轨+(-15%)止损  : 均值+5.86% t=2.31 胜率79% 最差-16.1% 期末$6,114 ← 采用
 
-选 C 的理由：
-1. C 严格优于 A——上行完全相同，下行从-22.3%收窄到-17.9%，无代价
-2. C vs B 统计上无法区分（bootstrap 10000次，C优于B仅65.5%，需>95%）
-   但 C 少一个拟合参数：B 的+15%止盈位无独立依据，是在同一份数据上挑出的；
-   C 的两条规则各有理由（止损=封尾部风险，10日=资金周转）
-3. 策略赚的是深度回调后的大幅反弹，止盈会截断收益来源
-   （B 把 +50/+34/+34 削成 +25/+21/+21）
+选 D1 的理由（不是因为收益更高——总收益与C基本持平）：
+1. 有市场逻辑：买入时%b中位11%(贴下轨)，回中轨=均值回归完成；固定N日是人为设定
+2. 稳定性显著更好：胜率71%→79%，最大连亏2→1笔
+3. 样本外更稳：不利半段 C为-5.60% / D1仅-0.32%（两者利润都集中在后半段）
+4. 槽位周转快：平均持有9.5→4.9日，同一信号流多成交36%(14→19笔)，
+   验证速度也更快（更快累积到80~100笔门槛）
 
-⚠️ t值仍 < 2，策略尚未通过统计检验，当前仅可用于 SIMULATE 验证。
+⚠️ t=2.31 看似过了门槛，但这是在同一份15~20笔样本上搜索了约33种配置后得到的，
+属于 p-hacking，不能视为通过统计检验。门槛已改为前瞻样本外验证。
+当前仅可用于 SIMULATE。
 """
 from __future__ import annotations
 
@@ -41,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止盈
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
-MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "10"))
+MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "20"))  # D1下仅作兜底
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
 MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "5"))  # 总资金5000/单笔1000 → 最多5只并持
 
@@ -164,23 +168,32 @@ def _trading_days_held(entry_date: str) -> int:
     return int(np.busday_count(entry, today))
 
 
-def check_exit_signal(pos: dict, current_price: float) -> Optional[str]:
-    """返回 'take_profit' / 'stop_loss' / 'max_hold' / None
+def check_exit_signal(pos: dict, current_price: float,
+                      boll_mid: Optional[float] = None) -> Optional[str]:
+    """返回 'stop_loss' / 'boll_mid' / 'max_hold' / 'take_profit' / None
 
-    当前策略（方案C）默认不设止盈：TAKE_PROFIT_PCT<=0 时禁用止盈，
-    让反弹跑满 MAX_HOLD_DAYS，仅用 STOP_LOSS_PCT 封住尾部风险。
-    理由：策略赚的就是深度回调后的大幅反弹，人为设止盈会截断收益来源，
-    且止盈位没有独立依据（纯拟合产物）。详见 STRATEGY.md §5.5。
+    方案D1（2026-09-09 采用）出场优先级：
+      1. stop_loss  跌破 STOP_LOSS_PCT(-15%)   —— 封尾部风险
+      2. boll_mid   价格回升到布林带中轨(MA20) —— 均值回归完成，主出场路径(约90%)
+      3. max_hold   持有超 MAX_HOLD_DAYS(20日) —— 安全兜底，防止无限持有
+      take_profit 默认禁用（TAKE_PROFIT_PCT=0）
+
+    为什么用中轨而非固定天数：买入时 %b 中位仅11%（贴近下轨），
+    回到中轨即均值回归完成，有市场含义；固定N日纯属人为设定。
+    实测：胜率 71%→79%，最大连亏 2→1 笔，样本外不利半段 -5.6%→-0.3%。
+    详见 STRATEGY.md §5.6。
     """
     entry = pos.get("entry_price")
     if not entry or entry <= 0:
         return None
     chg = (current_price - entry) / entry
 
-    if TAKE_PROFIT_PCT > 0 and chg >= TAKE_PROFIT_PCT:
-        return "take_profit"
     if chg <= STOP_LOSS_PCT:
         return "stop_loss"
+    if TAKE_PROFIT_PCT > 0 and chg >= TAKE_PROFIT_PCT:
+        return "take_profit"
+    if boll_mid and boll_mid > 0 and current_price >= boll_mid:
+        return "boll_mid"
 
     entry_date = pos.get("entry_date")
     if entry_date and _trading_days_held(entry_date) >= MAX_HOLD_DAYS:

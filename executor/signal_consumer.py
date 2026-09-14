@@ -4,24 +4,22 @@ Guru Tracker 信号消费 & 自动下单
 调度（cron 09:35 ET，周一至周五）：
   python -m executor.signal_consumer
 
-买入条件（三选二组合，2026-06~09 历史信号 sweep 得出，见下方 SWEEP 说明）：
+买入条件（AND，2026-06~09 历史信号 sweep 得出）：
 1. score >= MIN_SCORE（触发阈值）
 2. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认30%）
 3. 该笔信号仓位占比（ARK etf_percent）> GURU_MIN_POSITION_PCT（默认0.10%）
 
-SWEEP 依据（回调>=30% + 仓位>0.10%，持仓10日，n=30）：
-  胜率 67%，均值收益 +9.2%，Sharpe 2.78，PF 2.25
-放弃"连续买入"这条（单独统计样本量过小，且与仓位/回调条件高度重叠）。
-本金规模较小时优先胜率，故选30%回调门槛而非20%（触发更少但更准）。
+出场规则（方案D1，2026-09-09 采用，详见 STRATEGY.md §5.6）：
+1. 跌破 -15% → 止损（封尾部风险）
+2. 价格回升到布林带中轨 MA20 → 均值回归完成，主出场路径（约90%）
+3. 持有超 20 个交易日 → 安全兜底
+
+为什么不用固定持有天数：买入时 %b 中位仅11%（贴近布林下轨），
+回到中轨即均值回归完成，有市场含义；固定N日纯属人为设定。
+实测 胜率71%→79%，最大连亏2→1笔，平均持有9.5→4.9日，
+槽位周转快使同一信号流多成交36%（14→19笔）。
 
 仓位管理：本金5000美元，单笔额度1000美元，最多同时持仓 GURU_MAX_POSITIONS（默认5）只。
-
-逻辑：
-1. 读取近2日 score >= MIN_SCORE 的 buy 信号
-2. 过滤：回调幅度 + 仓位占比双重门槛
-3. 跳过已持仓的 ticker，检查当前持仓数是否已达上限
-4. 按 GURU_BUDGET_USD（默认1000）限价买入
-5. 检查所有 open 持仓：止盈/止损/到期（10日）三种平仓触发
 """
 from __future__ import annotations
 
@@ -57,8 +55,9 @@ def _notify(text: str) -> None:
         logger.error("[consumer] 飞书通知发送失败: %s", e)
 
 MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
-DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "20"))       # 相对60日高点回调百分比（正数）
+DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))       # 相对60日高点回调百分比（正数）
 MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))  # ARK仓位占比阈值
+BOLL_PERIOD = int(os.getenv("GURU_BOLL_PERIOD", "20"))            # 布林中轨周期(布林带标准默认值)
 
 _POS_PCT_RE = re.compile(r"占基金仓位: ([\d.]+)%")
 
@@ -105,10 +104,10 @@ def _extract_position_pct(raw_content: str) -> float:
     return float(m.group(1)) if m else 0.0
 
 
-def _get_drawdown_pct(ticker: str) -> Optional[float]:
-    """相对近60个交易日收盘价最高点的回调百分比（正数，越大回调越深）"""
+def _fetch_closes(ticker: str) -> Optional[list]:
+    """拉取 FMP 日线收盘价（按日期降序，closes[0]=最新）。买入/卖出共用，每票每轮只请求一次。"""
     if not FMP_API_KEY:
-        logger.warning("[consumer] FMP_API_KEY 未配置，无法计算回调幅度，跳过该过滤")
+        logger.warning("[consumer] FMP_API_KEY 未配置，无法获取历史价格")
         return None
     url = f"{FMP_STABLE_URL}/historical-price-eod/full"
     try:
@@ -121,26 +120,51 @@ def _get_drawdown_pct(ticker: str) -> Optional[float]:
                      ticker, resp.status_code, elapsed_ms)
         resp.raise_for_status()
         data = resp.json()
-        if not data or len(data) < 20:
-            logger.warning("[consumer][API] FMP %s 返回数据不足 (%d条)，无法计算回调",
-                           ticker, len(data) if data else 0)
+        if not data:
+            logger.warning("[consumer][API] FMP %s 无返回数据", ticker)
             return None
-        # FMP 返回按日期降序，最新在前
-        closes = [d["close"] for d in data[:60] if d.get("close")]
-        if len(closes) < 20:
+        closes = [d["close"] for d in data[:80] if d.get("close")]
+        if len(closes) < 25:
             logger.warning("[consumer][API] FMP %s 有效收盘价不足 (%d条)", ticker, len(closes))
             return None
-        latest = closes[0]
-        recent_high = max(closes)
-        if recent_high <= 0:
-            return None
-        dd = (1 - latest / recent_high) * 100
-        logger.debug("[consumer] %s 回调计算: 最新=%.2f 近60日高=%.2f → 回调%.1f%%",
-                     ticker, latest, recent_high, dd)
-        return dd
+        return closes
     except Exception as e:
         logger.error("[consumer][API] FMP historical-price-eod %s 失败: %s", ticker, e)
         return None
+
+
+def _get_drawdown_pct(ticker: str, closes: Optional[list] = None) -> Optional[float]:
+    """相对近60个交易日收盘价最高点的回调百分比（正数，越大回调越深）"""
+    if closes is None:
+        closes = _fetch_closes(ticker)
+    if not closes:
+        return None
+    window = closes[:60]
+    latest, recent_high = window[0], max(window)
+    if recent_high <= 0:
+        return None
+    dd = (1 - latest / recent_high) * 100
+    logger.debug("[consumer] %s 回调计算: 最新=%.2f 近60日高=%.2f → 回调%.1f%%",
+                 ticker, latest, recent_high, dd)
+    return dd
+
+
+def _get_boll_mid(ticker: str, closes: Optional[list] = None) -> Optional[float]:
+    """布林带中轨 = MA(N) 收盘均线。
+
+    关键口径：跳过 closes[0]。线上在 09:35 运行时当日尚未收盘，
+    FMP 的 closes[0] 是当日盘中价（未完成bar），必须用前 N 个**已完成**收盘价，
+    与回测中"用前一日收盘计算带、与当日开盘价比较"的口径一致。
+    """
+    if closes is None:
+        closes = _fetch_closes(ticker)
+    if not closes or len(closes) < BOLL_PERIOD + 1:
+        return None
+    completed = closes[1:BOLL_PERIOD + 1]     # 跳过当日未完成bar
+    ma = sum(completed) / len(completed)
+    logger.debug("[consumer] %s 布林中轨: MA%d=%.4f (用%s~%s的已完成收盘)",
+                 ticker, BOLL_PERIOD, ma, len(completed), "前1日")
+    return ma
 
 
 def _passes_entry_filter(sig: dict) -> bool:
@@ -156,7 +180,7 @@ def _passes_entry_filter(sig: dict) -> bool:
                     ticker, pos_pct, MIN_POSITION_PCT)
         return False
 
-    drawdown = _get_drawdown_pct(ticker)
+    drawdown = _get_drawdown_pct(ticker, closes=_fetch_closes(ticker))
     if drawdown is None:
         logger.warning("[信号过滤] ❌ %s 无法获取回调幅度（FMP数据缺失），保守跳过", ticker)
         return False
@@ -276,8 +300,8 @@ def run() -> None:
         logger.info("-" * 70)
         positions = get_open_positions()
         tp_desc = f"止盈+{TAKE_PROFIT_PCT*100:.0f}%" if TAKE_PROFIT_PCT > 0 else "止盈已禁用"
-        logger.info("[卖出阶段] 检查 %d 个持仓 (%s / 止损%.0f%% / 到期%d日)",
-                    len(positions), tp_desc, STOP_LOSS_PCT * 100, MAX_HOLD_DAYS)
+        logger.info("[卖出阶段] 检查 %d 个持仓 (回中轨MA%d / %s / 止损%.0f%% / 上限%d日)",
+                    len(positions), BOLL_PERIOD, tp_desc, STOP_LOSS_PCT * 100, MAX_HOLD_DAYS)
 
         for pos in positions:
             if pos["status"] == "closing":
@@ -293,14 +317,17 @@ def run() -> None:
             entry = pos["entry_price"] or 0
             pnl = (price / entry - 1) * 100 if entry else 0
             held = _trading_days_held(pos["entry_date"]) if pos.get("entry_date") else 0
+            boll_mid = _get_boll_mid(ticker)
 
-            reason = check_exit_signal(pos, price)
+            reason = check_exit_signal(pos, price, boll_mid=boll_mid)
             if not reason:
-                logger.info("[卖出阶段] 持有中 %-8s 现价=$%-8.2f 成本=$%-8.2f 浮盈=%+6.2f%% 持有%d日",
-                            ticker, price, entry, pnl, held)
+                mid_txt = f" 中轨=${boll_mid:.2f}(差{(boll_mid/price-1)*100:+.1f}%)" if boll_mid else " 中轨=N/A"
+                logger.info("[卖出阶段] 持有中 %-8s 现价=$%-8.2f 成本=$%-8.2f 浮盈=%+6.2f%% 持有%d日%s",
+                            ticker, price, entry, pnl, held, mid_txt)
                 continue
 
-            reason_label = {"take_profit": "止盈", "stop_loss": "止损", "max_hold": "到期平仓"}.get(reason, reason)
+            reason_label = {"take_profit": "止盈", "stop_loss": "止损",
+                            "boll_mid": "回归中轨", "max_hold": "到期平仓"}.get(reason, reason)
             logger.info("[卖出阶段] 🔔 %s 触发【%s】现价=$%.2f 成本=$%.2f 盈亏=%+.2f%% 持有%d日",
                         ticker, reason_label, price, entry, pnl, held)
 
