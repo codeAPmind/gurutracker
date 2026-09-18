@@ -261,9 +261,19 @@ class GuruFutuTrader:
         logger.info("[futu] disconnected")
 
     def _resolve_acc_id(self) -> None:
-        from futu import RET_OK, TrdEnv, TrdMarket
+        """选出与当前 trd_env 匹配的可用账户。
 
-        env_acc = os.getenv("FUTU_ACCOUNT_US", "").strip()
+        2026-09-18 修复：原实现用**全部**账户列表校验 FUTU_ACCOUNT_US，
+        没按 trd_env 过滤。结果 SIMULATE 模式下实盘账户ID"校验通过"，
+        直到 place_order 才报 "Nonexisting acc_id"，导致连续多日静默空转。
+        acc_list 同时包含 REAL / SIMULATE 两套账户，两者 acc_id 完全不同。
+        """
+        from futu import RET_OK, TrdEnv
+
+        is_sim = self.trd_env == TrdEnv.SIMULATE
+        env_key = "FUTU_ACCOUNT_US_SIM" if is_sim else "FUTU_ACCOUNT_US"
+        env_acc = os.getenv(env_key, "").strip()
+        want_env = "SIMULATE" if is_sim else "REAL"
 
         logger.info("[futu][API] get_acc_list()")
         ret, df = self.ctx.get_acc_list()
@@ -272,38 +282,51 @@ class GuruFutuTrader:
             raise RuntimeError(f"[futu] get_acc_list failed: {df}")
         logger.info("[futu][API] get_acc_list → %d accounts", len(df))
 
-        def _total_assets(acc_row) -> float:
+        # 只保留 trd_env 匹配且状态 ACTIVE 的账户
+        cand = df[df["trd_env"].astype(str).str.upper() == want_env]
+        if "acc_status" in cand.columns:
+            cand = cand[cand["acc_status"].astype(str).str.upper() == "ACTIVE"]
+        if cand.empty:
+            raise RuntimeError(
+                f"[futu] OpenD 中没有可用的 {want_env} 美股账户（共{len(df)}个账户）。"
+                f"请检查 OpenD 登录状态，或确认该环境下已开通模拟/实盘交易权限。"
+            )
+        logger.info("[futu] %s 环境下可用账户: %s", want_env,
+                    [int(r["acc_id"]) for _, r in cand.iterrows()])
+
+        def _total_assets(acc_id: int) -> float:
             try:
-                ret2, df2 = self.ctx.accinfo_query(
-                    trd_env=self.trd_env, acc_id=int(acc_row["acc_id"])
-                )
+                ret2, df2 = self.ctx.accinfo_query(trd_env=self.trd_env, acc_id=acc_id)
                 if ret2 != RET_OK or df2.empty:
                     return 0.0
                 return float(df2.iloc[0].get("total_assets", 0) or 0)
             except Exception:
                 return 0.0
 
-        acc_ids = [int(r["acc_id"]) for _, r in df.iterrows()]
+        cand_ids = [int(r["acc_id"]) for _, r in cand.iterrows()]
 
         if env_acc:
             target = int(env_acc)
-            if target in acc_ids:
+            if target in cand_ids:
                 self.acc_id = target
-                ta = _total_assets(df[df["acc_id"] == target].iloc[0])
-                logger.info("[futu] using FUTU_ACCOUNT_US=%s total_assets=%.0f", target, ta)
+                logger.info("[futu] 使用 %s=%s (env=%s) total_assets=%.0f",
+                            env_key, target, want_env, _total_assets(target))
                 return
-            logger.warning("[futu] FUTU_ACCOUNT_US=%s not in acc_list, auto-picking", target)
+            logger.warning(
+                "[futu] ⚠️ %s=%s 不是可用的 %s 账户（该环境可用: %s），改为自动选择。"
+                "若要指定，请设置 %s 为上述之一。",
+                env_key, target, want_env, cand_ids, env_key,
+            )
 
-        # 自动选资产最多的美股账户
         best_id, best_ta = None, -1.0
-        for _, row in df.iterrows():
-            ta = _total_assets(row)
+        for aid in cand_ids:
+            ta = _total_assets(aid)
             if ta > best_ta:
-                best_ta = ta
-                best_id = int(row["acc_id"])
+                best_ta, best_id = ta, aid
 
         self.acc_id = best_id
-        logger.info("[futu] auto-selected acc_id=%s total_assets=%.0f", best_id, best_ta)
+        logger.info("[futu] 自动选定 acc_id=%s (env=%s) total_assets=%.0f",
+                    best_id, want_env, best_ta)
 
     def get_position(self, code: str) -> int:
         """返回 US.CODE 当前持仓股数（can_sell_qty）"""

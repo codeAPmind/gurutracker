@@ -295,6 +295,13 @@ def run() -> None:
                 )
             else:
                 logger.error("[买入阶段] ❌ %s 下单失败", ticker)
+                _notify(
+                    f"⚠️ 买入下单失败\n"
+                    f"股票: {ticker}\n"
+                    f"参考价: ${price:.2f}  预算: ${BUDGET_USD:,.0f}\n"
+                    f"信号分数: {sig['score']:.0f}\n"
+                    f"请查看 logs/cron.log 中 place_order 的错误详情"
+                )
 
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         logger.info("-" * 70)
@@ -366,6 +373,12 @@ def run() -> None:
                 )
             else:
                 logger.error("[卖出阶段] ❌ %s 卖单下单失败（%s）", ticker, reason_label)
+                _notify(
+                    f"🚨 卖出下单失败（{reason_label}）\n"
+                    f"股票: {ticker}  持仓{pos['qty']}股\n"
+                    f"现价: ${price:.2f}  成本: ${entry:.2f}  盈亏: {pnl:+.2f}%\n"
+                    f"⚠️ 仓位仍未平，请人工确认"
+                )
 
     finally:
         logger.info("-" * 70)
