@@ -19,7 +19,8 @@ Guru Tracker 信号消费 & 自动下单
 实测 胜率71%→79%，最大连亏2→1笔，平均持有9.5→4.9日，
 槽位周转快使同一信号流多成交36%（14→19笔）。
 
-仓位管理：本金5000美元，单笔额度1000美元，最多同时持仓 GURU_MAX_POSITIONS（默认5）只。
+仓位管理：2 个槽位，单笔额度 1000 美元（见 STRATEGY.md §5.7）。
+每轮连接券商后先对账（见 STRATEGY.md §5.9），再买入/卖出。
 """
 from __future__ import annotations
 
@@ -37,9 +38,10 @@ from executor.position_manager import (
     BUDGET_USD, MAX_HOLD_DAYS, MAX_POSITIONS, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
     _trading_days_held, already_holding, check_exit_signal, close_position,
     get_open_positions, init_db, mark_closing, open_position,
+    reconcile_with_broker, record_pending_buy,
 )
 from executor.futu_trader import GuruFutuTrader
-from notifier.feishu_bot import send_text_to_feishu
+from notifier.feishu_bot import notify_reconcile, notify_run_summary, notify_trade_error, send_trade_text
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +49,10 @@ _ENV_TAG = "🧪模拟盘" if GURU_TRADE_ENV.upper() != "REAL" else "💰实盘"
 
 
 def _notify(text: str) -> None:
-    """所有 executor 下单/成交通知统一走这里，方便在飞书里区分来源"""
+    """executor 告警/补充说明走交易群（下单/成交卡片由 futu_trader 直接发）。"""
     msg = f"【GuruTracker执行器·{_ENV_TAG}】\n{text}"
     try:
-        send_text_to_feishu(msg)
+        send_trade_text(msg)
     except Exception as e:
         logger.error("[consumer] 飞书通知发送失败: %s", e)
 
@@ -227,7 +229,22 @@ def run() -> None:
         trader.connect()
     except Exception as e:
         logger.error("[启动失败] Futu 连接失败，本轮终止: %s", e)
+        notify_trade_error("Futu 连接失败", f"本轮终止，未下单。\n**原因**: {e}")
         return
+
+    try:
+        rec = reconcile_with_broker(trader)
+        logger.info(
+            "[对账] broker=%d local=%d ghosts=%d adopted=%d qty_fixed=%d reset_closing=%d unmanaged=%d failed=%s",
+            rec.get("broker_count", 0), rec.get("local_count", 0),
+            len(rec.get("ghosts") or []), len(rec.get("adopted") or []),
+            len(rec.get("qty_fixed") or []), len(rec.get("reset_closing") or []),
+            len(rec.get("unmanaged") or []), rec.get("query_failed"),
+        )
+        notify_reconcile(rec)
+    except Exception as e:
+        logger.error("[对账] 执行失败（继续本轮，但持仓可能不准）: %s", e)
+        notify_trade_error("持仓对账失败", f"本轮仍会买卖，请人工核对券商持仓。\n**原因**: {e}")
 
     buy_placed, sell_placed = 0, 0
     try:
@@ -267,14 +284,6 @@ def run() -> None:
                 logger.info("[买入成交] ✅ %s qty=%d 均价=$%.4f 金额=$%.0f order=%s",
                             _ticker, qty, avg_price, qty * avg_price, _oid_holder[0] or "?")
                 open_position(_ticker, _sig["id"], _oid_holder[0] or "", qty, avg_price)
-                _notify(
-                    f"✅ 买入成交\n"
-                    f"股票: {_ticker}\n"
-                    f"数量: {qty} 股\n"
-                    f"成交价: ${avg_price:.2f}\n"
-                    f"金额: ${qty * avg_price:,.0f}\n"
-                    f"信号分数: {_sig['score']:.0f}"
-                )
 
             order_id = trader.place_entry_order(
                 ticker=ticker,
@@ -284,24 +293,11 @@ def run() -> None:
             )
             if order_id:
                 _on_fill.__closure__[3].cell_contents[0] = order_id  # patch _oid_holder
+                record_pending_buy(ticker, sig["id"], order_id)
                 slots_left -= 1
                 buy_placed += 1
-                _notify(
-                    f"📤 已下单 BUY\n"
-                    f"股票: {ticker}\n"
-                    f"参考价: ${price:.2f}\n"
-                    f"预算: ${BUDGET_USD:,.0f}\n"
-                    f"order_id: {order_id}"
-                )
             else:
                 logger.error("[买入阶段] ❌ %s 下单失败", ticker)
-                _notify(
-                    f"⚠️ 买入下单失败\n"
-                    f"股票: {ticker}\n"
-                    f"参考价: ${price:.2f}  预算: ${BUDGET_USD:,.0f}\n"
-                    f"信号分数: {sig['score']:.0f}\n"
-                    f"请查看 logs/cron.log 中 place_order 的错误详情"
-                )
 
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         logger.info("-" * 70)
@@ -311,9 +307,16 @@ def run() -> None:
                     len(positions), BOLL_PERIOD, tp_desc, STOP_LOSS_PCT * 100, MAX_HOLD_DAYS)
 
         for pos in positions:
+            if pos["status"] == "pending":
+                logger.info("[卖出阶段] ⏭️  %s 买单尚未入账(order=%s)，跳过出场",
+                            pos["ticker"], pos.get("entry_order_id", "?"))
+                continue
             if pos["status"] == "closing":
                 logger.info("[卖出阶段] ⏭️  %s 已在平仓中(order=%s)，跳过",
                             pos["ticker"], pos.get("exit_order_id", "?"))
+                continue
+            if int(pos.get("qty") or 0) <= 0:
+                logger.warning("[卖出阶段] ⏭️  %s qty=0，跳过", pos["ticker"])
                 continue
             ticker = pos["ticker"]
             price = trader.get_price(ticker)
@@ -344,14 +347,6 @@ def run() -> None:
                 pnl_pct = (avg_price / entry - 1) * 100 if entry else 0
                 logger.info("[卖出成交] 🔴 %s qty=%d 均价=$%.4f 成本=$%.4f 盈亏=%+.2f%% (%s)",
                             _ticker, qty, avg_price, entry, pnl_pct, _reason)
-                _notify(
-                    f"🔴 卖出成交（{_reason}）\n"
-                    f"股票: {_ticker}\n"
-                    f"数量: {qty} 股\n"
-                    f"成交价: ${avg_price:.2f}\n"
-                    f"买入价: ${entry:.2f}\n"
-                    f"盈亏: {pnl_pct:+.2f}%"
-                )
 
             exit_order_id = trader.place_sell_order(
                 ticker=ticker,
@@ -363,14 +358,6 @@ def run() -> None:
             if exit_order_id:
                 mark_closing(pos["id"], exit_order_id)
                 sell_placed += 1
-                _notify(
-                    f"📤 已下单 SELL（触发: {reason_label}）\n"
-                    f"股票: {ticker}\n"
-                    f"数量: {pos['qty']} 股\n"
-                    f"参考价: ${price:.2f}\n"
-                    f"买入价: ${pos['entry_price'] or 0:.2f}\n"
-                    f"order_id: {exit_order_id}"
-                )
             else:
                 logger.error("[卖出阶段] ❌ %s 卖单下单失败（%s）", ticker, reason_label)
                 _notify(
@@ -385,6 +372,12 @@ def run() -> None:
         logger.info("[本轮结束] 买单%d笔 卖单%d笔 | 当前持仓%d/%d | 环境=%s",
                     buy_placed, sell_placed, len(get_open_positions()), MAX_POSITIONS, _ENV_TAG)
         logger.info("=" * 70)
+        try:
+            if buy_placed or sell_placed:
+                trader.wait_for_pending_fills(timeout=90)
+                notify_run_summary(buy_placed, sell_placed, len(get_open_positions()), MAX_POSITIONS)
+        except Exception as e:
+            logger.error("[consumer] 等待成交或汇总通知失败: %s", e)
         trader.close()
 
 

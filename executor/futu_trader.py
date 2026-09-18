@@ -10,11 +10,21 @@ Futu 美股下单封装（Guru Tracker 专用）
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from datetime import datetime, timedelta
 from typing import Callable, Optional
+
+from config.settings import (
+    FUTU_ACCOUNT_US,
+    FUTU_ACCOUNT_US_SIM,
+    FUTU_HOST,
+    FUTU_PORT,
+    FUTU_TRADE_PWD,
+    FUTU_TRADE_PWD_MD5,
+    GURU_TRADE_ENV,
+)
+from notifier.feishu_bot import notify_order_filled, notify_order_placed, notify_trade_error
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,51 @@ _late_fills: dict[str, dict] = {}  # order_id → {qty, price, first_seen}
 _late_fills_lock = threading.Lock()
 
 _cb_lock = threading.Lock()
+
+# 下单元数据：成交通知 / 轮询补漏都靠它
+_order_meta: dict[str, dict] = {}
+_notified_fill_state: dict[str, tuple] = {}
+_notified_fill_lock = threading.Lock()
+
+
+def _remember_order(order_id: str, **meta) -> None:
+    _order_meta[order_id] = {"order_id": order_id, **meta}
+
+
+def _pending_fill_ids() -> list[str]:
+    with _cb_lock:
+        return [oid for oid in _fill_callbacks if oid not in _cb_retire_at]
+
+
+def _handle_fill_push(order_id: str, status: str, filled_qty: int, filled_price: float) -> None:
+    """统一处理成交推送：callback + 飞书通知。轮询和 TradeOrderHandler 共用。"""
+    is_final = status in ("FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED")
+    fill_statuses = ("FILLED_PART", "FILLED_ALL", "CANCELLED_PART")
+
+    if status in fill_statuses and filled_qty > 0:
+        _dispatch_fill(order_id, filled_qty, filled_price, is_final=status == "FILLED_ALL")
+        dedup_key = (status, filled_qty)
+        with _notified_fill_lock:
+            is_dup = _notified_fill_state.get(order_id) == dedup_key
+            if not is_dup:
+                _notified_fill_state[order_id] = dedup_key
+        if not is_dup:
+            meta = _order_meta.get(order_id, {})
+            notify_order_filled({
+                "order_id": order_id,
+                "ticker": meta.get("ticker", ""),
+                "code": meta.get("code", ""),
+                "side": meta.get("side", ""),
+                "purpose": meta.get("purpose", ""),
+                "filled_qty": filled_qty,
+                "filled_price": filled_price,
+            })
+        else:
+            logger.debug("[futu] skip duplicate fill notify order=%s status=%s qty=%d",
+                         order_id, status, filled_qty)
+
+    if is_final:
+        stop_order_monitor.remove(order_id)
 
 
 def _register_fill_callback(order_id: str, cb: Callable) -> None:
@@ -227,31 +282,120 @@ class GuruFutuTrader:
         self.ctx = None
         self.acc_id: Optional[int] = None
         self._connected = False
+        self.env_str = GURU_TRADE_ENV
+        self._fill_handler_set = False
 
     def connect(self) -> None:
         from futu import TrdEnv, TrdMarket, OpenSecTradeContext
 
-        host = os.getenv("FUTU_HOST", "127.0.0.1")
-        port = int(os.getenv("FUTU_PORT", "11112"))
-        pwd_md5 = os.getenv("FUTU_TRADE_PWD_MD5", "")
-        env_str = os.getenv("GURU_TRADE_ENV", "SIMULATE")
-        self.trd_env = TrdEnv.REAL if env_str.upper() == "REAL" else TrdEnv.SIMULATE
+        self.env_str = GURU_TRADE_ENV
+        self.trd_env = TrdEnv.REAL if self.env_str.upper() == "REAL" else TrdEnv.SIMULATE
 
-        logger.info("[futu][API] OpenSecTradeContext(host=%s, port=%d, market=US)", host, port)
+        logger.info("[futu][API] OpenSecTradeContext(host=%s, port=%d, market=US)", FUTU_HOST, FUTU_PORT)
         self.ctx = OpenSecTradeContext(
             filter_trdmarket=TrdMarket.US,
-            host=host,
-            port=port,
+            host=FUTU_HOST,
+            port=FUTU_PORT,
             is_encrypt=False,
         )
-        if pwd_md5:
-            logger.info("[futu][API] unlock_trade()")
-            unlock_ret = self.ctx.unlock_trade(pwd_md5, is_unlock=True)
-            logger.info("[futu][API] unlock_trade result=%s", unlock_ret)
-
+        self._unlock()
         self._resolve_acc_id()
+        self._setup_order_handler()
         self._connected = True
-        logger.info("[futu] connected env=%s acc_id=%s", env_str, self.acc_id)
+        logger.info("[futu] connected env=%s acc_id=%s", self.env_str, self.acc_id)
+
+    def _unlock(self) -> None:
+        """实盘必须解锁。对齐 US_YiDong_AutoTrader：优先 MD5，否则用 FUTU_TRADE_PWD 明文。"""
+        from futu import RET_OK
+
+        is_real = self.env_str.upper() == "REAL"
+        if FUTU_TRADE_PWD_MD5:
+            logger.info("[futu][API] unlock_trade(password_md5)")
+            ret, data = self.ctx.unlock_trade(password_md5=FUTU_TRADE_PWD_MD5)
+            if ret != RET_OK:
+                raise RuntimeError(f"[futu] 解锁交易失败(MD5): {data}")
+            logger.info("[futu] 交易已解锁（MD5）env=%s", self.env_str)
+            return
+        if FUTU_TRADE_PWD:
+            logger.info("[futu][API] unlock_trade(FUTU_TRADE_PWD)")
+            ret, data = self.ctx.unlock_trade(FUTU_TRADE_PWD)
+            if ret != RET_OK:
+                raise RuntimeError(f"[futu] 解锁交易失败: {data}")
+            logger.info("[futu] 交易已解锁（明文密码）env=%s", self.env_str)
+            return
+        if is_real:
+            raise RuntimeError(
+                "[futu] 实盘必须配置 FUTU_TRADE_PWD 或 FUTU_TRADE_PWD_MD5"
+                "（与 US_YiDong_AutoTrader 相同）"
+            )
+        logger.warning("[futu] 未设置交易密码，仿真盘可能不需要解锁")
+
+    def _setup_order_handler(self) -> None:
+        """订阅 Futu 成交推送。没有这个 handler，_dispatch_fill 永远不会被调用。"""
+        from futu import TradeOrderHandlerBase, RET_OK
+
+        class _OrderHandler(TradeOrderHandlerBase):
+            def on_recv_rsp(self, rsp_pb):
+                ret, data = super().on_recv_rsp(rsp_pb)
+                if ret != RET_OK or data is None or data.empty:
+                    return ret, data
+                for _, row in data.iterrows():
+                    order_id = str(row.get("order_id", ""))
+                    status = str(row.get("order_status", ""))
+                    filled_qty = int(row.get("dealt_qty", 0) or 0)
+                    filled_price = float(row.get("dealt_avg_price", 0) or 0)
+                    logger.info("[futu] 订单推送 order=%s status=%s filled=%d@%.4f",
+                                order_id, status, filled_qty, filled_price)
+                    if not order_id:
+                        continue
+                    if not _order_meta.get(order_id):
+                        code = str(row.get("code", "") or "")
+                        side = str(row.get("trd_side", "") or "")
+                        _remember_order(
+                            order_id,
+                            ticker=code.replace("US.", "") if code else "",
+                            code=code,
+                            side="SELL" if "SELL" in side.upper() else "BUY",
+                            purpose=str(row.get("remark", "") or ""),
+                        )
+                    _handle_fill_push(order_id, status, filled_qty, filled_price)
+                return ret, data
+
+        self.ctx.set_handler(_OrderHandler())
+        self._fill_handler_set = True
+        logger.info("[futu] TradeOrderHandler 已注册")
+
+    def wait_for_pending_fills(self, timeout: float = 90.0) -> None:
+        """cron 短进程：下单后等成交推送/轮询，避免还没收到成交就退出。"""
+        from futu import RET_OK
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pending = _pending_fill_ids()
+            if not pending:
+                return
+            logger.info("[futu] 等待成交回报 %d 笔: %s", len(pending), pending)
+            try:
+                ret, df = self.ctx.order_list_query(trd_env=self.trd_env, acc_id=self.acc_id)
+                if ret == RET_OK and df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        oid = str(row.get("order_id", ""))
+                        if oid not in pending:
+                            continue
+                        status = str(row.get("order_status", ""))
+                        filled_qty = int(row.get("dealt_qty", 0) or 0)
+                        filled_price = float(row.get("dealt_avg_price", 0) or 0)
+                        if filled_qty > 0 or status in (
+                            "FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED"
+                        ):
+                            _handle_fill_push(oid, status, filled_qty, filled_price)
+            except Exception as e:
+                logger.error("[futu] order_list_query 轮询失败: %s", e)
+            time.sleep(1)
+
+        leftover = _pending_fill_ids()
+        if leftover:
+            logger.warning("[futu] 等待成交超时(%.0fs)，仍未完成: %s", timeout, leftover)
 
     def close(self) -> None:
         if self.ctx:
@@ -272,7 +416,7 @@ class GuruFutuTrader:
 
         is_sim = self.trd_env == TrdEnv.SIMULATE
         env_key = "FUTU_ACCOUNT_US_SIM" if is_sim else "FUTU_ACCOUNT_US"
-        env_acc = os.getenv(env_key, "").strip()
+        env_acc = (FUTU_ACCOUNT_US_SIM if is_sim else FUTU_ACCOUNT_US).strip()
         want_env = "SIMULATE" if is_sim else "REAL"
 
         logger.info("[futu][API] get_acc_list()")
@@ -305,18 +449,32 @@ class GuruFutuTrader:
 
         cand_ids = [int(r["acc_id"]) for _, r in cand.iterrows()]
 
+        if not is_sim and not env_acc:
+            raise RuntimeError(
+                "[futu] 实盘必须显式配置 FUTU_ACCOUNT_US，禁止自动选择账户"
+                f"（当前 REAL 可用账户: {cand_ids}）"
+            )
+
         if env_acc:
             target = int(env_acc)
             if target in cand_ids:
+                ta = _total_assets(target)
+                if not is_sim and ta <= 0:
+                    raise RuntimeError(
+                        f"[futu] 实盘账户 {target} 总资产为 0，拒绝下单。"
+                        "请确认 FUTU_ACCOUNT_US 是否为有资金的 REAL 账户。"
+                    )
                 self.acc_id = target
                 logger.info("[futu] 使用 %s=%s (env=%s) total_assets=%.0f",
-                            env_key, target, want_env, _total_assets(target))
+                            env_key, target, want_env, ta)
                 return
-            logger.warning(
-                "[futu] ⚠️ %s=%s 不是可用的 %s 账户（该环境可用: %s），改为自动选择。"
-                "若要指定，请设置 %s 为上述之一。",
-                env_key, target, want_env, cand_ids, env_key,
+            msg = (
+                f"[futu] {env_key}={target} 不是可用的 {want_env} 账户"
+                f"（该环境可用: {cand_ids}）"
             )
+            if not is_sim:
+                raise RuntimeError(msg + "。实盘禁止自动改选账户。")
+            logger.warning("%s，改为自动选择。", msg)
 
         best_id, best_ta = None, -1.0
         for aid in cand_ids:
@@ -327,6 +485,32 @@ class GuruFutuTrader:
         self.acc_id = best_id
         logger.info("[futu] 自动选定 acc_id=%s (env=%s) total_assets=%.0f",
                     best_id, want_env, best_ta)
+
+    def list_positions(self) -> list[dict]:
+        """券商当前美股持仓快照。qty 用 can_sell_qty（可卖），成本用 cost_price。"""
+        from futu import RET_OK
+
+        logger.info("[futu][API] position_list_query(all)")
+        ret, df = self.ctx.position_list_query(trd_env=self.trd_env, acc_id=self.acc_id)
+        if ret != RET_OK:
+            raise RuntimeError(f"position_list_query failed: {df}")
+        if df is None or df.empty:
+            logger.info("[futu][API] position_list_query → 无持仓")
+            return []
+        out = []
+        for _, row in df.iterrows():
+            code = str(row.get("code", "") or "")
+            if not code.startswith("US."):
+                continue
+            qty = int(row.get("can_sell_qty", 0) or row.get("qty", 0) or 0)
+            if qty <= 0:
+                continue
+            cost = float(row.get("cost_price", 0) or row.get("diluted_cost", 0) or 0)
+            ticker = code.replace("US.", "", 1)
+            out.append({"code": code, "ticker": ticker, "qty": qty, "cost_price": cost})
+        logger.info("[futu] 券商美股持仓 %d 只: %s",
+                    len(out), ", ".join(f"{p['ticker']}:{p['qty']}" for p in out) or "-")
+        return out
 
     def get_position(self, code: str) -> int:
         """返回 US.CODE 当前持仓股数（can_sell_qty）"""
@@ -396,11 +580,35 @@ class GuruFutuTrader:
         )
         if ret != RET_OK or df.empty:
             logger.error("[futu][API] place_order(BUY) failed ticker=%s: %s", ticker, df)
+            notify_trade_error(
+                f"买入下单失败 {ticker}",
+                f"**股票**: `{ticker}`\n**参考价**: ${ref_price:.2f}\n**预算**: ${budget_usd:,.0f}\n**原因**: {df}",
+            )
             return None
 
         order_id = str(df.iloc[0]["order_id"])
+        _remember_order(
+            order_id,
+            ticker=ticker,
+            code=code,
+            side="BUY",
+            qty=qty,
+            price=limit_price,
+            purpose="ENTRY",
+            env=self.env_str,
+        )
         if on_fill:
             _register_fill_callback(order_id, on_fill)
+        notify_order_placed({
+            "order_id": order_id,
+            "ticker": ticker,
+            "code": code,
+            "side": "BUY",
+            "qty": qty,
+            "price": limit_price,
+            "purpose": "ENTRY",
+            "env": self.env_str,
+        })
         logger.info("[futu] BUY 下单成功 order=%s %s qty=%d price=%.4f", order_id, ticker, qty, limit_price)
         return order_id
 
@@ -431,12 +639,36 @@ class GuruFutuTrader:
         )
         if ret != RET_OK or df.empty:
             logger.error("[futu][API] place_order(SELL) failed %s %s: %s", purpose, ticker, df)
+            notify_trade_error(
+                f"卖出下单失败 {ticker}",
+                f"**股票**: `{ticker}`\n**用途**: {purpose}\n**数量**: {qty} 股\n**参考价**: ${ref_price:.2f}\n**原因**: {df}",
+            )
             return None
 
         order_id = str(df.iloc[0]["order_id"])
+        _remember_order(
+            order_id,
+            ticker=ticker,
+            code=code,
+            side="SELL",
+            qty=qty,
+            price=limit_price,
+            purpose=purpose,
+            env=self.env_str,
+        )
         if on_fill:
             _register_fill_callback(order_id, on_fill)
         stop_order_monitor.register(order_id, code, qty, ref_price, self)
+        notify_order_placed({
+            "order_id": order_id,
+            "ticker": ticker,
+            "code": code,
+            "side": "SELL",
+            "qty": qty,
+            "price": limit_price,
+            "purpose": purpose,
+            "env": self.env_str,
+        })
         logger.info("[futu] SELL 下单成功 order=%s %s qty=%d price=%.4f (%s)",
                     order_id, ticker, qty, limit_price, purpose)
         return order_id
@@ -445,6 +677,7 @@ class GuruFutuTrader:
         """市价卖出（止损升级 / 紧急出局）"""
         from futu import RET_OK, TrdSide, OrderType
 
+        ticker = str(ticker).replace("US.", "")
         code = f"US.{ticker}"
         qty = self._adjust_sell_qty(code, qty, purpose)
         if qty <= 0:
@@ -464,9 +697,33 @@ class GuruFutuTrader:
         )
         if ret != RET_OK or df.empty:
             logger.error("[futu][API] place_order(MARKET_SELL) failed %s %s: %s", purpose, ticker, df)
+            notify_trade_error(
+                f"市价卖出失败 {ticker}",
+                f"**股票**: `{ticker}`\n**用途**: {purpose}\n**数量**: {qty} 股\n**原因**: {df}",
+            )
             return None
 
         order_id = str(df.iloc[0]["order_id"])
+        _remember_order(
+            order_id,
+            ticker=ticker,
+            code=code,
+            side="SELL",
+            qty=qty,
+            price=0,
+            purpose=purpose,
+            env=self.env_str,
+        )
+        notify_order_placed({
+            "order_id": order_id,
+            "ticker": ticker,
+            "code": code,
+            "side": "SELL",
+            "qty": qty,
+            "price": 0,
+            "purpose": purpose,
+            "env": self.env_str,
+        })
         logger.info("[futu] MARKET_SELL 下单成功 order=%s %s qty=%d (%s)", order_id, ticker, qty, purpose)
         return order_id
 
@@ -495,8 +752,8 @@ class GuruFutuTrader:
         """获取最新成交价"""
         try:
             from futu import OpenQuoteContext, RET_OK
-            host = os.getenv("FUTU_HOST", "127.0.0.1")
-            port = int(os.getenv("FUTU_PORT", "11112"))
+            host = FUTU_HOST
+            port = FUTU_PORT
             logger.debug("[futu][API] get_market_snapshot(US.%s)", ticker)
             qctx = OpenQuoteContext(host=host, port=port)
             ret, df = qctx.get_market_snapshot([f"US.{ticker}"])

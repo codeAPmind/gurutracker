@@ -47,7 +47,7 @@ TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止�
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
 MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "20"))  # D1下仅作兜底
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
-MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "5"))  # 总资金5000/单笔1000 → 最多5只并持
+MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "2"))  # 2槽 × $1000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS guru_positions (
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS guru_positions (
     qty INTEGER NOT NULL DEFAULT 0,
     entry_price REAL,
     entry_date TEXT,
-    status TEXT NOT NULL DEFAULT 'open',   -- open / closing / closed
+    status TEXT NOT NULL DEFAULT 'open',   -- pending / open / closing / closed
     exit_price REAL,
     exit_date TEXT,
     pnl_pct REAL,
@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS guru_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_gpos_ticker ON guru_positions(ticker);
 CREATE INDEX IF NOT EXISTS idx_gpos_status ON guru_positions(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gpos_open_ticker
+    ON guru_positions(ticker) WHERE status IN ('pending', 'open', 'closing');
 """
 
 
@@ -83,20 +85,120 @@ def init_db() -> None:
         con.executescript(_SCHEMA)
 
 
-def open_position(ticker: str, signal_id: int, order_id: str,
+def open_position(ticker: str, signal_id: Optional[int], order_id: str,
                   qty: int, entry_price: float) -> int:
+    """买入成交后入账。若已有 pending/open/closing 同行则更新，避免成交回报补记时插重复行。"""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     with _conn() as con:
-        cur = con.execute(
-            """INSERT INTO guru_positions
-               (ticker, signal_id, entry_order_id, qty, entry_price, entry_date, status)
-               VALUES (?, ?, ?, ?, ?, ?, 'open')""",
-            (ticker, signal_id, order_id, qty, entry_price, today),
-        )
-        pos_id = cur.lastrowid
+        existing = con.execute(
+            """SELECT id FROM guru_positions
+               WHERE ticker=? AND status IN ('pending', 'open', 'closing')
+               ORDER BY id DESC LIMIT 1""",
+            (ticker,),
+        ).fetchone()
+        if existing:
+            con.execute(
+                """UPDATE guru_positions
+                   SET signal_id=COALESCE(?, signal_id),
+                       entry_order_id=?, qty=?, entry_price=?,
+                       entry_date=COALESCE(entry_date, ?),
+                       status='open', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (signal_id or None, order_id, qty, entry_price, today, existing["id"]),
+            )
+            pos_id = existing["id"]
+            logger.info("[持仓DB] 更新持仓 pos_id=%d %s qty=%d 成本=$%.4f order=%s → open",
+                        pos_id, ticker, qty, entry_price, order_id)
+            return pos_id
+        try:
+            cur = con.execute(
+                """INSERT INTO guru_positions
+                   (ticker, signal_id, entry_order_id, qty, entry_price, entry_date, status)
+                   VALUES (?, ?, ?, ?, ?, ?, 'open')""",
+                (ticker, signal_id, order_id, qty, entry_price, today),
+            )
+            pos_id = cur.lastrowid
+        except sqlite3.IntegrityError:
+            existing = con.execute(
+                """SELECT id FROM guru_positions
+                   WHERE ticker=? AND status IN ('pending', 'open', 'closing')
+                   ORDER BY id DESC LIMIT 1""",
+                (ticker,),
+            ).fetchone()
+            if not existing:
+                raise
+            con.execute(
+                """UPDATE guru_positions
+                   SET signal_id=COALESCE(?, signal_id),
+                       entry_order_id=?, qty=?, entry_price=?,
+                       entry_date=COALESCE(entry_date, ?),
+                       status='open', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (signal_id or None, order_id, qty, entry_price, today, existing["id"]),
+            )
+            pos_id = existing["id"]
+            logger.info("[持仓DB] 更新持仓 pos_id=%d %s qty=%d 成本=$%.4f order=%s → open",
+                        pos_id, ticker, qty, entry_price, order_id)
+            return pos_id
     logger.info("[持仓DB] 新建持仓 pos_id=%d %s qty=%d 成本=$%.4f 建仓日=%s signal_id=%s order=%s",
                 pos_id, ticker, qty, entry_price, today, signal_id, order_id)
     return pos_id
+
+
+def record_pending_buy(ticker: str, signal_id: int, order_id: str) -> int:
+    """下单成功、尚未成交：先占槽位，避免成交回报丢失后库里没有这只票。
+
+    若成交回报已抢先把同行写成 open，则不再插 pending，避免同一 ticker 两行。
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with _conn() as con:
+        existing = con.execute(
+            """SELECT id, status FROM guru_positions
+               WHERE ticker=? AND status IN ('pending', 'open', 'closing')
+               ORDER BY id DESC LIMIT 1""",
+            (ticker,),
+        ).fetchone()
+        if existing:
+            if existing["status"] == "pending":
+                con.execute(
+                    """UPDATE guru_positions
+                       SET signal_id=COALESCE(?, signal_id),
+                           entry_order_id=?, updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (signal_id or None, order_id, existing["id"]),
+                )
+            logger.info("[持仓DB] 待成交已有记录 pos_id=%d %s status=%s，不重复插入",
+                        existing["id"], ticker, existing["status"])
+            return existing["id"]
+        try:
+            cur = con.execute(
+                """INSERT INTO guru_positions
+                   (ticker, signal_id, entry_order_id, qty, entry_price, entry_date, status)
+                   VALUES (?, ?, ?, 0, NULL, ?, 'pending')""",
+                (ticker, signal_id, order_id, today),
+            )
+            pos_id = cur.lastrowid
+        except sqlite3.IntegrityError:
+            row = con.execute(
+                """SELECT id FROM guru_positions
+                   WHERE ticker=? AND status IN ('pending', 'open', 'closing')
+                   LIMIT 1""",
+                (ticker,),
+            ).fetchone()
+            pos_id = row["id"] if row else 0
+    logger.info("[持仓DB] 待成交 pos_id=%d %s order=%s", pos_id, ticker, order_id)
+    return pos_id
+
+
+def _set_status(pos_id: int, status: str, **fields) -> None:
+    sets = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
+    args: list = [status]
+    for k, v in fields.items():
+        sets.append(f"{k}=?")
+        args.append(v)
+    args.append(pos_id)
+    with _conn() as con:
+        con.execute(f"UPDATE guru_positions SET {', '.join(sets)} WHERE id=?", args)
 
 
 def mark_closing(pos_id: int, exit_order_id: str) -> None:
@@ -128,7 +230,9 @@ def close_position(pos_id: int, exit_price: float) -> None:
 def get_open_positions() -> list[dict]:
     with _conn() as con:
         rows = con.execute(
-            "SELECT * FROM guru_positions WHERE status IN ('open', 'closing') ORDER BY created_at"
+            """SELECT * FROM guru_positions
+               WHERE status IN ('pending', 'open', 'closing')
+               ORDER BY created_at"""
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -137,7 +241,7 @@ def already_holding(ticker: str, trader=None) -> bool:
     """本地记录表 + broker 真实持仓 双重检查，避免在已有仓位(含非本系统开的)上重复买入"""
     with _conn() as con:
         row = con.execute(
-            "SELECT id FROM guru_positions WHERE ticker=? AND status IN ('open', 'closing') LIMIT 1",
+            "SELECT id FROM guru_positions WHERE ticker=? AND status IN ('pending', 'open', 'closing') LIMIT 1",
             (ticker,),
         ).fetchone()
     if row is not None:
@@ -199,3 +303,105 @@ def check_exit_signal(pos: dict, current_price: float,
     if entry_date and _trading_days_held(entry_date) >= MAX_HOLD_DAYS:
         return "max_hold"
     return None
+
+
+def _known_tickers() -> set[str]:
+    """本系统曾经记过的 ticker（含已平仓）。未知券商持仓不得认领。"""
+    with _conn() as con:
+        rows = con.execute("SELECT DISTINCT ticker FROM guru_positions").fetchall()
+    return {r["ticker"] for r in rows if r["ticker"]}
+
+
+def reconcile_with_broker(trader) -> dict:
+    """每轮启动：本地 pending/open/closing 与券商可卖数量对账。
+
+    只管理 Guru 自己的票：
+      - 库有、券商已空 → 幽灵仓，关闭释放槽位（查询失败则不动，避免误删）
+      - pending + 券商有仓 → 成交回报丢了，补成 open
+      - closing + 券商仍有仓 → 卖单丢失，改回 open 让本轮重新出场
+      - 数量不一致 → 以券商 can_sell_qty 为准
+      - 券商多出来、且历史出现过 → 补记 open（卖出回调把库平了但实际没卖掉）
+      - 券商多出来、本系统从未见过 → 只告警，不认领（YiDong / 手建 / 测试单）
+    """
+    summary: dict = {
+        "ghosts": [],
+        "adopted": [],
+        "qty_fixed": [],
+        "unmanaged": [],
+        "reset_closing": [],
+        "broker_count": 0,
+        "local_count": 0,
+        "query_failed": False,
+        "error": "",
+    }
+    try:
+        broker_rows = trader.list_positions()
+    except Exception as e:
+        logger.error("[对账] 券商持仓查询失败，本轮不清理本地仓: %s", e)
+        summary["query_failed"] = True
+        summary["error"] = str(e)
+        summary["local_count"] = len(get_open_positions())
+        return summary
+
+    broker = {p["ticker"]: p for p in broker_rows}
+    summary["broker_count"] = len(broker)
+    local = get_open_positions()
+    summary["local_count"] = len(local)
+    local_tickers = {p["ticker"] for p in local}
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    for pos in local:
+        ticker = pos["ticker"]
+        bp = broker.get(ticker)
+        bqty = int(bp["qty"]) if bp else 0
+        bcost = float(bp.get("cost_price") or 0) if bp else 0.0
+        if bqty <= 0:
+            close_position(pos["id"], pos.get("entry_price") or 0)
+            summary["ghosts"].append({"ticker": ticker, "qty": int(pos.get("qty") or 0)})
+            logger.warning("[对账] 幽灵仓 %s 库有券商无，已关闭 pos_id=%s", ticker, pos["id"])
+            continue
+
+        fields: dict = {}
+        old_qty = int(pos.get("qty") or 0)
+        if old_qty != bqty:
+            fields["qty"] = bqty
+            if pos["status"] != "pending":
+                summary["qty_fixed"].append(
+                    {"ticker": ticker, "from_qty": old_qty, "to_qty": bqty}
+                )
+        if (not pos.get("entry_price") or float(pos["entry_price"]) <= 0) and bcost > 0:
+            fields["entry_price"] = bcost
+        if not pos.get("entry_date"):
+            fields["entry_date"] = today
+
+        if pos["status"] == "pending":
+            _set_status(pos["id"], "open", **fields)
+            summary["adopted"].append({"ticker": ticker, "qty": bqty})
+            logger.warning("[对账] pending 已在券商成交，补记为 open %s qty=%d", ticker, bqty)
+        elif pos["status"] == "closing":
+            _set_status(pos["id"], "open", **fields)
+            summary["reset_closing"].append(ticker)
+            logger.warning("[对账] closing 但券商仍有仓，改回 open 以便重试卖出 %s qty=%d",
+                           ticker, bqty)
+        elif fields:
+            _set_status(pos["id"], "open", **fields)
+            logger.info("[对账] 按券商修正 %s %s", ticker, fields)
+
+    known = _known_tickers()
+    for ticker, bp in broker.items():
+        if ticker in local_tickers:
+            continue
+        bqty = int(bp.get("qty") or 0)
+        if bqty <= 0:
+            continue
+        if ticker in known:
+            cost = float(bp.get("cost_price") or 0)
+            open_position(ticker, None, "reconcile", bqty, cost)
+            summary["adopted"].append({"ticker": ticker, "qty": bqty})
+            logger.warning("[对账] 历史跟过的票券商仍有仓，补记 open %s qty=%d", ticker, bqty)
+        else:
+            summary["unmanaged"].append({"ticker": ticker, "qty": bqty})
+            logger.warning("[对账] 未跟踪持仓 %s %d股（不认领、不自动卖）", ticker, bqty)
+
+    summary["local_count"] = len(get_open_positions())
+    return summary
