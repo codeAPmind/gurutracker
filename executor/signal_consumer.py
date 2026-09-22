@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -73,10 +74,19 @@ def _us_today() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
+SIGNAL_WINDOW_DAYS = int(os.getenv("GURU_SIGNAL_WINDOW_DAYS", "5"))
+
+
 def _fetch_pending_signals() -> list[dict]:
-    """返回近2日 score >= MIN_SCORE 的 buy 信号（去重 ticker 取最高分）"""
+    """返回近 SIGNAL_WINDOW_DAYS 天 score >= MIN_SCORE 的 buy 信号（去重 ticker 取最高分）
+
+    2026-09-22 修复：窗口从 2 天放宽到 5 天。原 2 天窗口下，若某信号当轮下单失败
+    （如 IONS 9/15 撞上 acc_id bug、或 FMP 拉取失败被跳过），隔天+周末就滑出窗口，
+    再也不会被重试——系统"假装没有信号"。放宽窗口让过线未成交的信号得到重试；
+    安全阀是每轮实时重算回调：若价格已反弹则回调<30%自然淘汰，already_holding 防重复买。
+    """
     today = _us_today()
-    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=SIGNAL_WINDOW_DAYS)).strftime("%Y-%m-%d")
 
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -106,33 +116,51 @@ def _extract_position_pct(raw_content: str) -> float:
     return float(m.group(1)) if m else 0.0
 
 
+_FMP_MAX_RETRY = 3          # FMP 偶发 Connection reset by peer，需重试而非直接弃权
+_FMP_RETRY_BACKOFF = 1.5    # 秒，指数退避基数
+
+
 def _fetch_closes(ticker: str) -> Optional[list]:
-    """拉取 FMP 日线收盘价（按日期降序，closes[0]=最新）。买入/卖出共用，每票每轮只请求一次。"""
+    """拉取 FMP 日线收盘价（按日期降序，closes[0]=最新）。买入/卖出共用，每票每轮只请求一次。
+
+    2026-09-22 修复：FMP 单次请求经常 Connection reset by peer，原实现直接返回 None
+    → 信号被"保守跳过"。CRWV/AVAV/IONS 多次因此丢单。改为最多重试 3 次（指数退避）。
+    """
     if not FMP_API_KEY:
         logger.warning("[consumer] FMP_API_KEY 未配置，无法获取历史价格")
         return None
     url = f"{FMP_STABLE_URL}/historical-price-eod/full"
-    try:
-        params = {"symbol": ticker, "apikey": FMP_API_KEY}
-        logger.debug("[consumer][API] GET %s?symbol=%s", url, ticker)
-        t0 = datetime.now()
-        resp = requests.get(url, params=params, timeout=15)
-        elapsed_ms = (datetime.now() - t0).total_seconds() * 1000
-        logger.debug("[consumer][API] FMP historical-price-eod %s → HTTP %d (%.0fms)",
-                     ticker, resp.status_code, elapsed_ms)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
-            logger.warning("[consumer][API] FMP %s 无返回数据", ticker)
-            return None
-        closes = [d["close"] for d in data[:80] if d.get("close")]
-        if len(closes) < 25:
-            logger.warning("[consumer][API] FMP %s 有效收盘价不足 (%d条)", ticker, len(closes))
-            return None
-        return closes
-    except Exception as e:
-        logger.error("[consumer][API] FMP historical-price-eod %s 失败: %s", ticker, e)
-        return None
+    params = {"symbol": ticker, "apikey": FMP_API_KEY}
+    last_err = None
+    for attempt in range(1, _FMP_MAX_RETRY + 1):
+        try:
+            t0 = datetime.now()
+            resp = requests.get(url, params=params, timeout=15)
+            elapsed_ms = (datetime.now() - t0).total_seconds() * 1000
+            logger.debug("[consumer][API] FMP %s 第%d次 → HTTP %d (%.0fms)",
+                         ticker, attempt, resp.status_code, elapsed_ms)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                logger.warning("[consumer][API] FMP %s 无返回数据", ticker)
+                return None
+            closes = [d["close"] for d in data[:80] if d.get("close")]
+            if len(closes) < 25:
+                logger.warning("[consumer][API] FMP %s 有效收盘价不足 (%d条)", ticker, len(closes))
+                return None
+            if attempt > 1:
+                logger.info("[consumer][API] FMP %s 第%d次重试成功", ticker, attempt)
+            return closes
+        except Exception as e:
+            last_err = e
+            if attempt < _FMP_MAX_RETRY:
+                wait = _FMP_RETRY_BACKOFF ** attempt
+                logger.warning("[consumer][API] FMP %s 第%d次失败(%s)，%.1fs后重试",
+                               ticker, attempt, e, wait)
+                time.sleep(wait)
+    logger.error("[consumer][API] FMP historical-price-eod %s 连续%d次失败: %s",
+                 ticker, _FMP_MAX_RETRY, last_err)
+    return None
 
 
 def _get_drawdown_pct(ticker: str, closes: Optional[list] = None) -> Optional[float]:
@@ -213,8 +241,8 @@ def run() -> None:
     init_db()
 
     signals = _fetch_pending_signals()
-    logger.info("[信号读取] 从 signals.db 取到 %d 条待评估买入信号 (score>=%.0f, 近2日)",
-                len(signals), MIN_SCORE)
+    logger.info("[信号读取] 从 signals.db 取到 %d 条待评估买入信号 (score>=%.0f, 近%d日)",
+                len(signals), MIN_SCORE, SIGNAL_WINDOW_DAYS)
     for s in signals:
         logger.info("  · %-8s score=%-4.0f 信号日=%s 来源=%s",
                     s["ticker"], s["score"], s.get("event_date", "?"), s.get("guru_name", "?"))

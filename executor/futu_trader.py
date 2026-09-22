@@ -282,6 +282,7 @@ class GuruFutuTrader:
         self.ctx = None
         self.acc_id: Optional[int] = None
         self._connected = False
+        self.trade_locked = False   # 解锁失败时置True，禁止下单（见 _unlock）
         self.env_str = GURU_TRADE_ENV
         self._fill_handler_set = False
 
@@ -302,33 +303,71 @@ class GuruFutuTrader:
         self._resolve_acc_id()
         self._setup_order_handler()
         self._connected = True
-        logger.info("[futu] connected env=%s acc_id=%s", self.env_str, self.acc_id)
+        logger.info("[futu] connected env=%s acc_id=%s trade_locked=%s",
+                    self.env_str, self.acc_id, self.trade_locked)
+        if self.trade_locked:
+            try:
+                notify_trade_error(
+                    "Futu 交易解锁失败",
+                    f"环境={self.env_str} 账户={self.acc_id}\n"
+                    f"已重试{self._UNLOCK_MAX_RETRY}次仍失败，本轮**禁止下单**。\n"
+                    f"行情与持仓检查照常运行。\n"
+                    f"常见原因：OpenD 断线或需重新登录 —— 请检查 OpenD 状态。",
+                )
+            except Exception as e:
+                logger.error("[futu] 解锁失败告警发送异常: %s", e)
+
+    _UNLOCK_MAX_RETRY = 3
+    _UNLOCK_BACKOFF = 2.0
 
     def _unlock(self) -> None:
-        """实盘必须解锁。对齐 US_YiDong_AutoTrader：优先 MD5，否则用 FUTU_TRADE_PWD 明文。"""
+        """实盘必须解锁。对齐 US_YiDong_AutoTrader：优先 MD5，否则用 FUTU_TRADE_PWD 明文。
+
+        2026-09-22 修复：解锁失败常见于 OpenD 瞬时断线（"F3CNN返回错误，可能是参数错误
+        或者断线"，见 9/21 日志），原实现一次失败就抛异常终止整轮——连已有持仓的
+        止损/中轨检查都跑不到。改为重试 3 次；仍失败则标记 self.trade_locked=True，
+        让调用方跳过下单但继续执行卖出检查（卖出同样需要解锁，但至少能拿到行情并告警）。
+        """
         from futu import RET_OK
 
         is_real = self.env_str.upper() == "REAL"
-        if FUTU_TRADE_PWD_MD5:
-            logger.info("[futu][API] unlock_trade(password_md5)")
-            ret, data = self.ctx.unlock_trade(password_md5=FUTU_TRADE_PWD_MD5)
-            if ret != RET_OK:
-                raise RuntimeError(f"[futu] 解锁交易失败(MD5): {data}")
-            logger.info("[futu] 交易已解锁（MD5）env=%s", self.env_str)
+        pwd_md5, pwd_plain = FUTU_TRADE_PWD_MD5, FUTU_TRADE_PWD
+
+        if not pwd_md5 and not pwd_plain:
+            if is_real:
+                raise RuntimeError(
+                    "[futu] 实盘必须配置 FUTU_TRADE_PWD 或 FUTU_TRADE_PWD_MD5"
+                    "（与 US_YiDong_AutoTrader 相同）"
+                )
+            logger.warning("[futu] 未设置交易密码，仿真盘可能不需要解锁")
             return
-        if FUTU_TRADE_PWD:
-            logger.info("[futu][API] unlock_trade(FUTU_TRADE_PWD)")
-            ret, data = self.ctx.unlock_trade(FUTU_TRADE_PWD)
-            if ret != RET_OK:
-                raise RuntimeError(f"[futu] 解锁交易失败: {data}")
-            logger.info("[futu] 交易已解锁（明文密码）env=%s", self.env_str)
-            return
-        if is_real:
-            raise RuntimeError(
-                "[futu] 实盘必须配置 FUTU_TRADE_PWD 或 FUTU_TRADE_PWD_MD5"
-                "（与 US_YiDong_AutoTrader 相同）"
-            )
-        logger.warning("[futu] 未设置交易密码，仿真盘可能不需要解锁")
+
+        mode = "MD5" if pwd_md5 else "明文密码"
+        last = None
+        for attempt in range(1, self._UNLOCK_MAX_RETRY + 1):
+            logger.info("[futu][API] unlock_trade(%s) 第%d次", mode, attempt)
+            try:
+                if pwd_md5:
+                    ret, data = self.ctx.unlock_trade(password_md5=pwd_md5)
+                else:
+                    ret, data = self.ctx.unlock_trade(pwd_plain)
+                if ret == RET_OK:
+                    self.trade_locked = False
+                    logger.info("[futu] 交易已解锁（%s）env=%s%s", mode, self.env_str,
+                                f"（第{attempt}次重试成功）" if attempt > 1 else "")
+                    return
+                last = data
+            except Exception as e:
+                last = e
+            if attempt < self._UNLOCK_MAX_RETRY:
+                wait = self._UNLOCK_BACKOFF * attempt
+                logger.warning("[futu] 解锁第%d次失败(%s)，%.1fs后重试", attempt, last, wait)
+                time.sleep(wait)
+
+        self.trade_locked = True
+        logger.error("[futu] ⚠️ 解锁连续%d次失败: %s —— 本轮禁止下单，"
+                     "但仍会继续检查持仓（如需平仓请人工介入）",
+                     self._UNLOCK_MAX_RETRY, last)
 
     def _setup_order_handler(self) -> None:
         """订阅 Futu 成交推送。没有这个 handler，_dispatch_fill 永远不会被调用。"""
@@ -561,6 +600,9 @@ class GuruFutuTrader:
                           ref_price: float,
                           on_fill: Optional[Callable] = None) -> Optional[str]:
         """限价买入，+0.5% 滑点"""
+        if self.trade_locked:
+            logger.error("[futu] ⛔ 交易未解锁，拒绝买入下单（避免静默失败）")
+            return None
         from futu import RET_OK, TrdSide, OrderType
 
         code = f"US.{ticker}"
@@ -616,6 +658,9 @@ class GuruFutuTrader:
                          purpose: str = "sell",
                          on_fill: Optional[Callable] = None) -> Optional[str]:
         """限价卖出，-0.5% 滑点，注册止损升级监控"""
+        if self.trade_locked:
+            logger.error("[futu] ⛔ 交易未解锁，拒绝卖出下单（避免静默失败）")
+            return None
         from futu import RET_OK, TrdSide, OrderType
 
         code = f"US.{ticker}"
@@ -675,6 +720,9 @@ class GuruFutuTrader:
 
     def place_market_sell(self, ticker: str, qty: int, purpose: str = "market_sell") -> Optional[str]:
         """市价卖出（止损升级 / 紧急出局）"""
+        if self.trade_locked:
+            logger.error("[futu] ⛔ 交易未解锁，拒绝市价卖出下单（避免静默失败）")
+            return None
         from futu import RET_OK, TrdSide, OrderType
 
         ticker = str(ticker).replace("US.", "")
