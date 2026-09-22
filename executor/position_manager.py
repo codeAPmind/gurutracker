@@ -145,6 +145,33 @@ def open_position(ticker: str, signal_id: Optional[int], order_id: str,
     return pos_id
 
 
+def adopt_existing(
+    ticker: str,
+    qty: int,
+    entry_price: float,
+    entry_date: str,
+    signal_id: Optional[int] = None,
+    order_id: str = "manual",
+) -> int:
+    """认领已在券商的人工跟单仓，纳入每日 D1 卖出。对账不会自动认领陌生 ticker。"""
+    ticker = ticker.upper().replace("US.", "")
+    if qty <= 0 or entry_price <= 0:
+        raise ValueError(f"adopt_existing {ticker}: qty/price 无效")
+    datetime.strptime(entry_date, "%Y-%m-%d")
+    pos_id = open_position(ticker, signal_id, order_id, qty, entry_price)
+    with _conn() as con:
+        con.execute(
+            """UPDATE guru_positions
+               SET entry_date=?, entry_price=?, qty=?, status='open',
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (entry_date, entry_price, qty, pos_id),
+        )
+    logger.info("[持仓DB] 认领人工仓 pos_id=%d %s qty=%d 成本=$%.4f 建仓日=%s signal_id=%s",
+                pos_id, ticker, qty, entry_price, entry_date, signal_id)
+    return pos_id
+
+
 def record_pending_buy(ticker: str, signal_id: int, order_id: str) -> int:
     """下单成功、尚未成交：先占槽位，避免成交回报丢失后库里没有这只票。
 
