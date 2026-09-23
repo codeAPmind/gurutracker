@@ -47,7 +47,7 @@ TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止�
 STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
 MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "20"))  # D1下仅作兜底
 BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
-MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "2"))  # 2槽 × $1000
+MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "4"))  # 4槽 × $1000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS guru_positions (

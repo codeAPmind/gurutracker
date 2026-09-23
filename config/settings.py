@@ -57,10 +57,10 @@ FUTU_ACCOUNT_US_SIM = os.getenv("FUTU_ACCOUNT_US_SIM", "").strip()
 # Futu 模拟盘执行（executor/ 模块）
 # 参数来自 2026-06~09 历史信号 sweep：回调>=30% + 仓位>0.10%，持仓10日
 # 胜率67%，均值收益+9.2%，Sharpe 2.78，PF 2.25（n=30）
-# 单笔1000；2 槽同时持仓，占用分析见 STRATEGY.md §5.7
+# 单笔1000；4 槽同时持仓（2026-09-23 由 2 放宽），占用分析见 STRATEGY.md §5.7
 GURU_TRADE_ENV = os.getenv("GURU_TRADE_ENV", "SIMULATE")  # SIMULATE / REAL
 GURU_BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
-GURU_MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "2"))
+GURU_MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "4"))
 GURU_MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
 GURU_DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))
 GURU_MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))
