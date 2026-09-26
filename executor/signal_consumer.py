@@ -308,25 +308,47 @@ def run() -> None:
             logger.info("[买入阶段] 📤 准备买入 %s: score=%.0f 现价=$%.2f 预算=$%.0f 预计=%d股",
                         ticker, sig["score"], price, BUDGET_USD, int(BUDGET_USD / price))
 
-            def _on_fill(qty: int, avg_price: float, _ticker=ticker, _sig=sig, _oid_holder=[None]):
-                logger.info("[买入成交] ✅ %s qty=%d 均价=$%.4f 金额=$%.0f order=%s",
-                            _ticker, qty, avg_price, qty * avg_price, _oid_holder[0] or "?")
-                open_position(_ticker, _sig["id"], _oid_holder[0] or "", qty, avg_price)
+            # oid_holder 必须用默认参数绑定（每轮迭代一个新 list），
+            # 否则循环内闭包会共享同一个 cell 被后续迭代覆盖。
+            # 2026-09-26 修复：原来用 _on_fill.__closure__[3] 反向注入 order_id，
+            # 但 _ticker/_sig/_oid_holder 都是**默认参数不是闭包变量**，__closure__ 恒为 None，
+            # 该行必抛 TypeError，导致 record_pending_buy/计数器被跳过、
+            # wait_for_pending_fills 不执行，且异常一路冒到 finally 把**整个卖出阶段**也跳过。
+            oid_holder = [None]
 
-            order_id = trader.place_entry_order(
-                ticker=ticker,
-                budget_usd=BUDGET_USD,
-                ref_price=price,
-                on_fill=_on_fill,
-            )
+            def _on_fill(qty: int, avg_price: float, _ticker=ticker, _sig=sig, _h=oid_holder):
+                logger.info("[买入成交] ✅ %s qty=%d 均价=$%.4f 金额=$%.0f order=%s",
+                            _ticker, qty, avg_price, qty * avg_price, _h[0] or "?")
+                open_position(_ticker, _sig["id"], _h[0] or "", qty, avg_price)
+
+            try:
+                order_id = trader.place_entry_order(
+                    ticker=ticker,
+                    budget_usd=BUDGET_USD,
+                    ref_price=price,
+                    on_fill=_on_fill,
+                )
+            except Exception as e:
+                logger.error("[买入阶段] ❌ %s 下单异常: %s", ticker, e, exc_info=True)
+                _notify(f"⚠️ 买入下单异常\n股票: {ticker}\n{e}")
+                continue
+
             if order_id:
-                _on_fill.__closure__[3].cell_contents[0] = order_id  # patch _oid_holder
-                record_pending_buy(ticker, sig["id"], order_id)
+                oid_holder[0] = order_id
+                try:
+                    record_pending_buy(ticker, sig["id"], order_id)
+                except Exception as e:
+                    logger.error("[买入阶段] %s record_pending_buy 失败(不影响下单): %s", ticker, e)
                 slots_left -= 1
                 buy_placed += 1
             else:
                 logger.error("[买入阶段] ❌ %s 下单失败", ticker)
+    except Exception as e:
+        # 买入阶段整体异常绝不能连带跳过卖出检查（持仓的止损/中轨必须照常评估）
+        logger.error("[买入阶段] ❌ 阶段异常中断: %s", e, exc_info=True)
+        _notify(f"🚨 买入阶段异常中断\n{e}\n卖出检查仍会继续")
 
+    try:
         # ── 持仓止盈/止损/到期检查 ────────────────────────────────────
         logger.info("-" * 70)
         positions = get_open_positions()
@@ -394,6 +416,9 @@ def run() -> None:
                     f"现价: ${price:.2f}  成本: ${entry:.2f}  盈亏: {pnl:+.2f}%\n"
                     f"⚠️ 仓位仍未平，请人工确认"
                 )
+    except Exception as e:
+        logger.error("[卖出阶段] ❌ 阶段异常中断: %s", e, exc_info=True)
+        _notify(f"🚨 卖出阶段异常中断\n{e}\n⚠️ 持仓可能未被检查，请人工确认")
 
     finally:
         logger.info("-" * 70)
