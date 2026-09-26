@@ -60,11 +60,12 @@ FUTU_ACCOUNT_US_SIM = os.getenv("FUTU_ACCOUNT_US_SIM", "").strip()
 # 单笔1000；4 槽同时持仓（2026-09-23 由 2 放宽），占用分析见 STRATEGY.md §5.7
 GURU_TRADE_ENV = os.getenv("GURU_TRADE_ENV", "SIMULATE")  # SIMULATE / REAL
 GURU_BUDGET_USD = float(os.getenv("GURU_BUDGET_USD", "1000"))
-GURU_MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "4"))
+GURU_MAX_POSITIONS = int(os.getenv("GURU_MAX_POSITIONS", "5"))
 GURU_MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
 GURU_DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))
 GURU_MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))
 GURU_MAX_HOLD_DAYS = int(os.getenv("GURU_MAX_HOLD_DAYS", "20"))   # D1下仅作兜底
 GURU_BOLL_PERIOD = int(os.getenv("GURU_BOLL_PERIOD", "20"))       # 布林中轨周期
+GURU_REQUIRE_BELOW_BOLL_MID = os.getenv("GURU_REQUIRE_BELOW_BOLL_MID", "1") == "1"
 GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止盈
 GURU_STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))

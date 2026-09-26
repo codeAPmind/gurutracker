@@ -6,8 +6,10 @@ Guru Tracker 信号消费 & 自动下单
 
 买入条件（AND，2026-06~09 历史信号 sweep 得出）：
 1. score >= MIN_SCORE（触发阈值）
-2. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认30%）
-3. 该笔信号仓位占比（ARK etf_percent）> GURU_MIN_POSITION_PCT（默认0.10%）
+2. 该笔信号仓位占比（ARK etf_percent）> GURU_MIN_POSITION_PCT（默认0.10%）
+3. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认30%）
+4. 价格须在布林中轨 MA20 **下方**（2026-09-26 新增，见 STRATEGY.md §5.10）
+   ——否则等于买在出场线上方，次日必触发"回归中轨"空转
 
 出场规则（方案D1，2026-09-09 采用，详见 STRATEGY.md §5.6）：
 1. 跌破 -15% → 止损（封尾部风险）
@@ -19,7 +21,9 @@ Guru Tracker 信号消费 & 自动下单
 实测 胜率71%→79%，最大连亏2→1笔，平均持有9.5→4.9日，
 槽位周转快使同一信号流多成交36%（14→19笔）。
 
-仓位管理：2 个槽位，单笔额度 1000 美元（见 STRATEGY.md §5.7）。
+仓位管理：5 个槽位 × 单笔 $1000 = 满仓 $5000（见 STRATEGY.md §5.7/§5.11）。
+槽位按**并发峰值**配而非均值：信号成簇出现（ARK 常同日加仓多只），
+回测并发均值1.91只但峰值5只；若只留2槽会漏掉 8/13 笔。
 每轮连接券商后先对账（见 STRATEGY.md §5.9），再买入/卖出。
 """
 from __future__ import annotations
@@ -61,6 +65,7 @@ MIN_SCORE = float(os.getenv("GURU_MIN_SCORE", "50"))
 DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))       # 相对60日高点回调百分比（正数）
 MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))  # ARK仓位占比阈值
 BOLL_PERIOD = int(os.getenv("GURU_BOLL_PERIOD", "20"))            # 布林中轨周期(布林带标准默认值)
+REQUIRE_BELOW_BOLL_MID = os.getenv("GURU_REQUIRE_BELOW_BOLL_MID", "1") == "1"  # 入场须在中轨下方
 
 _POS_PCT_RE = re.compile(r"占基金仓位: ([\d.]+)%")
 
@@ -198,7 +203,21 @@ def _get_boll_mid(ticker: str, closes: Optional[list] = None) -> Optional[float]
 
 
 def _passes_entry_filter(sig: dict) -> bool:
-    """回调幅度 + 仓位占比双重门槛"""
+    """三重门槛：仓位占比 + 回调幅度 + 价格须在布林中轨下方
+
+    条件4（中轨）的由来（2026-09-26，见 STRATEGY.md §5.10）：
+    "距60日高点回调≥30%" 度量的是**历史峰值**，而出场规则用的是 MA20 **近期均值**。
+    两者可背离：股票3个月前从100跌到62，再反弹到74，此时相对旧高点仍回调26%，
+    但已高于 MA20(65) 13%。买进去 = 买在出场线上方 = 次日必触发"回归中轨" = 空转。
+
+    回测实证：D1 原19笔中有6笔(32%)属此类，全部第1日出场，均值 -0.07%。
+    拉长持有也救不回（5日 -0.81%、10日 +1.67% 但胜率跌到50%、最差 -19.9%）。
+    加此条件后：n 19→13，胜率 79%→85%，均值 +5.86%→+8.60%，期末资金几乎不变
+    （$6,114→$6,118，因那6笔净贡献≈0）。
+
+    这不是新增拟合参数——MA20 本就是出场用的同一条线，此条件只是消除
+    "入场已越过出场线"的逻辑矛盾。
+    """
     ticker = sig["ticker"]
     pos_pct = _extract_position_pct(sig.get("raw_content", ""))
 
@@ -210,7 +229,8 @@ def _passes_entry_filter(sig: dict) -> bool:
                     ticker, pos_pct, MIN_POSITION_PCT)
         return False
 
-    drawdown = _get_drawdown_pct(ticker, closes=_fetch_closes(ticker))
+    closes = _fetch_closes(ticker)          # 一次请求，回调与中轨共用
+    drawdown = _get_drawdown_pct(ticker, closes=closes)
     if drawdown is None:
         logger.warning("[信号过滤] ❌ %s 无法获取回调幅度（FMP数据缺失），保守跳过", ticker)
         return False
@@ -218,6 +238,24 @@ def _passes_entry_filter(sig: dict) -> bool:
         logger.info("[信号过滤] ❌ %s 回调%.1f%% < 阈值%.1f%%（条件3未过）仓位=%.2f%%",
                     ticker, drawdown, DRAWDOWN_PCT, pos_pct)
         return False
+
+    if REQUIRE_BELOW_BOLL_MID:
+        boll_mid = _get_boll_mid(ticker, closes=closes)
+        if boll_mid is None:
+            logger.warning("[信号过滤] ❌ %s 无法计算布林中轨，保守跳过", ticker)
+            return False
+        # 用 closes[0]（FMP当日盘中价）对比中轨——与上面回调检查同一价源，口径一致
+        px = closes[0]
+        if px >= boll_mid:
+            logger.info("[信号过滤] ❌ %s 现价$%.2f 已在中轨$%.2f 上方(+%.1f%%)，"
+                        "买入即触发回归中轨出场，跳过（条件4未过）",
+                        ticker, px, boll_mid, (px / boll_mid - 1) * 100)
+            return False
+        logger.info("[信号过滤] ✅ %s 通过全部条件: score=%.0f 回调=%.1f%%(>=%.0f%%) "
+                    "仓位=%.2f%%(>%.2f%%) 现价$%.2f<中轨$%.2f(%.1f%%空间)",
+                    ticker, sig["score"], drawdown, DRAWDOWN_PCT, pos_pct, MIN_POSITION_PCT,
+                    px, boll_mid, (boll_mid / px - 1) * 100)
+        return True
 
     logger.info("[信号过滤] ✅ %s 通过全部条件: score=%.0f 回调=%.1f%%(>=%.0f%%) 仓位=%.2f%%(>%.2f%%)",
                 ticker, sig["score"], drawdown, DRAWDOWN_PCT, pos_pct, MIN_POSITION_PCT)
