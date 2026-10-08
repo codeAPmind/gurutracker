@@ -4,10 +4,25 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+import re
+from dataclasses import dataclass
+
+from config.settings import GURU_MIN_POSITION_PCT
 
 logger = logging.getLogger(__name__)
+
+_POS_PCT_RE = re.compile(r"占基金仓位:\s*([\d.]+)%")
+
+
+def etf_position_from_raw(raw_content: str) -> tuple[str | None, float | None]:
+    """有「占基金仓位」数字时：>阈值→加仓，否则→试水。没有数字则 (None, None)。"""
+    m = _POS_PCT_RE.search(raw_content or "")
+    if not m:
+        return None, None
+    pct = float(m.group(1))
+    hint = "加仓" if pct > GURU_MIN_POSITION_PCT else "试水"
+    return hint, pct
 
 
 @dataclass
@@ -57,9 +72,15 @@ def score_signal(signal_data: dict, guru_config: dict, existing_signals: list, e
     score = 0.0
 
     # 1. 仓位权重 (0-30分)
+    # ARK 等带「占基金仓位」的记录以数字为准，不采用模型猜的「试水/重仓」
     position = signal_data.get("position_hint", "未知")
+    numeric_hint, _pct = etf_position_from_raw(signal_data.get("raw_content", ""))
+    if numeric_hint:
+        position = numeric_hint
     if position == "重仓":
         score += 30
+    elif position == "加仓":
+        score += 20
     elif position == "试水":
         score += 10
     else:

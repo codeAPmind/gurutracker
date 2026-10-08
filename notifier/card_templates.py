@@ -1,6 +1,15 @@
 """飞书消息卡片模板"""
 
 
+def _position_label(signal) -> str:
+    from processor.confidence_scorer import etf_position_from_raw
+
+    hint, pct = etf_position_from_raw(getattr(signal, "raw_content", "") or "")
+    if hint is not None and pct is not None:
+        return f"{hint} {pct:.2f}%"
+    return getattr(signal, "position_hint", "") or "未知"
+
+
 def build_signal_card(signal) -> dict:
     header_colors = {
         "买入": "green", "建仓": "green", "增持": "green", "看好": "green",
@@ -38,7 +47,7 @@ def build_signal_card(signal) -> dict:
             "is_short": True,
             "text": {
                 "tag": "lark_md",
-                "content": f"**仓位**: {signal.position_hint}"
+                "content": f"**仓位**: {_position_label(signal)}"
             }
         },
     ]

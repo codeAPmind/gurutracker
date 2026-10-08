@@ -10,6 +10,8 @@ Guru Tracker 信号消费 & 自动下单
 3. 价格相对近60日高点回调 >= GURU_DRAWDOWN_PCT（默认30%）
 4. 价格须在布林中轨 MA20 **下方**（2026-09-26 新增，见 STRATEGY.md §5.10）
    ——否则等于买在出场线上方，次日必触发"回归中轨"空转
+5. FINRA 近5日空头成交比均值 ≤ GURU_MAX_SHORT_RATIO（默认 0.65；见 STRATEGY.md §5.12）
+   ——SCTX 那种空头成交占比高位时禁止开仓；缺数据不否决
 
 出场规则（方案D1，2026-09-09 采用，详见 STRATEGY.md §5.6）：
 1. 跌破 -15% → 止损（封尾部风险）
@@ -46,6 +48,7 @@ from executor.position_manager import (
     reconcile_with_broker, record_pending_buy,
 )
 from executor.futu_trader import GuruFutuTrader
+from executor.short_volume import short_ratio_m5
 from notifier.feishu_bot import notify_reconcile, notify_run_summary, notify_trade_error, send_trade_text
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,7 @@ DRAWDOWN_PCT = float(os.getenv("GURU_DRAWDOWN_PCT", "30"))       # 相对60日�
 MIN_POSITION_PCT = float(os.getenv("GURU_MIN_POSITION_PCT", "0.10"))  # ARK仓位占比阈值
 BOLL_PERIOD = int(os.getenv("GURU_BOLL_PERIOD", "20"))            # 布林中轨周期(布林带标准默认值)
 REQUIRE_BELOW_BOLL_MID = os.getenv("GURU_REQUIRE_BELOW_BOLL_MID", "1") == "1"  # 入场须在中轨下方
+MAX_SHORT_RATIO = float(os.getenv("GURU_MAX_SHORT_RATIO", "0.65"))  # 0=关闭；>此值否决开仓
 
 _POS_PCT_RE = re.compile(r"占基金仓位: ([\d.]+)%")
 
@@ -202,8 +206,22 @@ def _get_boll_mid(ticker: str, closes: Optional[list] = None) -> Optional[float]
     return ma
 
 
+def _short_ratio_ok(ticker: str) -> bool:
+    """条件5：近5日空头成交比均值 > MAX_SHORT_RATIO 则否决。缺数据放行。"""
+    if MAX_SHORT_RATIO <= 0:
+        return True
+    m5 = short_ratio_m5(ticker, n=5)
+    if m5 is None:
+        return True
+    if m5 > MAX_SHORT_RATIO:
+        logger.info("[信号过滤] ❌ %s 空头成交比5日均值%.3f > %.2f（条件5未过）",
+                    ticker, m5, MAX_SHORT_RATIO)
+        return False
+    return True
+
+
 def _passes_entry_filter(sig: dict) -> bool:
-    """三重门槛：仓位占比 + 回调幅度 + 价格须在布林中轨下方
+    """买入门槛：仓位占比 + 回调幅度 + 价格须在布林中轨下方 + 空头成交比不高位
 
     条件4（中轨）的由来（2026-09-26，见 STRATEGY.md §5.10）：
     "距60日高点回调≥30%" 度量的是**历史峰值**，而出场规则用的是 MA20 **近期均值**。
@@ -251,12 +269,16 @@ def _passes_entry_filter(sig: dict) -> bool:
                         "买入即触发回归中轨出场，跳过（条件4未过）",
                         ticker, px, boll_mid, (px / boll_mid - 1) * 100)
             return False
+        if not _short_ratio_ok(ticker):
+            return False
         logger.info("[信号过滤] ✅ %s 通过全部条件: score=%.0f 回调=%.1f%%(>=%.0f%%) "
                     "仓位=%.2f%%(>%.2f%%) 现价$%.2f<中轨$%.2f(%.1f%%空间)",
                     ticker, sig["score"], drawdown, DRAWDOWN_PCT, pos_pct, MIN_POSITION_PCT,
                     px, boll_mid, (boll_mid / px - 1) * 100)
         return True
 
+    if not _short_ratio_ok(ticker):
+        return False
     logger.info("[信号过滤] ✅ %s 通过全部条件: score=%.0f 回调=%.1f%%(>=%.0f%%) 仓位=%.2f%%(>%.2f%%)",
                 ticker, sig["score"], drawdown, DRAWDOWN_PCT, pos_pct, MIN_POSITION_PCT)
     return True
@@ -272,8 +294,8 @@ def run() -> None:
     logger.info("=" * 70)
     logger.info("[启动] GuruTracker 执行器 | 环境=%s | 美东时间=%s",
                 _ENV_TAG, _us_today())
-    logger.info("[配置] 单笔预算=$%.0f 最大持仓=%d只 | 买入: score>=%.0f 回调>=%.0f%% 仓位>%.2f%%",
-                BUDGET_USD, MAX_POSITIONS, MIN_SCORE, DRAWDOWN_PCT, MIN_POSITION_PCT)
+    logger.info("[配置] 单笔预算=$%.0f 最大持仓=%d只 | 买入: score>=%.0f 回调>=%.0f%% 仓位>%.2f%% 空头比m5>%.2f否决",
+                BUDGET_USD, MAX_POSITIONS, MIN_SCORE, DRAWDOWN_PCT, MIN_POSITION_PCT, MAX_SHORT_RATIO)
     logger.info("=" * 70)
 
     init_db()

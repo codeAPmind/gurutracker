@@ -69,3 +69,5 @@ GURU_BOLL_PERIOD = int(os.getenv("GURU_BOLL_PERIOD", "20"))       # 布林中轨
 GURU_REQUIRE_BELOW_BOLL_MID = os.getenv("GURU_REQUIRE_BELOW_BOLL_MID", "1") == "1"
 GURU_TAKE_PROFIT_PCT = float(os.getenv("GURU_TAKE_PROFIT_PCT", "0"))  # 0=禁用止盈
 GURU_STOP_LOSS_PCT = float(os.getenv("GURU_STOP_LOSS_PCT", "-0.15"))
+# FINRA 近5日空头成交比均值 > 此值则否决开仓；0=关闭
+GURU_MAX_SHORT_RATIO = float(os.getenv("GURU_MAX_SHORT_RATIO", "0.65"))
